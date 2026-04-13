@@ -1,0 +1,15 @@
+mini-sentry
+cmd/guest/guest
+/guest
+samples/echo
+samples/cat
+samples/ls
+samples/pwd
+samples/edges
+samples/stress
+samples/sysfuzz
+testdata/fuzz/
+mini-sentry-linux-amd64
+guest-linux-amd64
+mini-sentry-linux-amd64
+guest-linux-amd64
