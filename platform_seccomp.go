@@ -149,13 +149,13 @@ func (p *SeccompPlatform) emulatedSyscalls() []uint32 {
 	return out
 }
 
-func (p *SeccompPlatform) Run(program string, args ...string) (int, error) {
+func (p *SeccompPlatform) Run(spec *ExecSpec) (int, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	path, err := exec.LookPath(program)
+	path, err := exec.LookPath(spec.Program)
 	if err != nil {
-		return -1, fmt.Errorf("program not found: %s: %w", program, err)
+		return -1, fmt.Errorf("program not found: %s: %w", spec.Program, err)
 	}
 
 	// Socketpair for handoff of the seccomp listener fd from child to parent.
@@ -181,32 +181,40 @@ func (p *SeccompPlatform) Run(program string, args ...string) (int, error) {
 		return -1, fmt.Errorf("os.Executable: %w", err)
 	}
 
-	// Strip our own bootstrap vars from the env we pass through, so the
-	// target doesn't accidentally re-enter bootstrap mode if it happens
-	// to be mini-sentry itself.
-	env := make([]string, 0, len(os.Environ())+2)
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, bootstrapEnvVar+"=") || strings.HasPrefix(e, emulatedEnvVar+"=") {
-			continue
-		}
-		env = append(env, e)
-	}
-	env = append(env,
+	// Strip our own bootstrap vars from the spec's base env so the
+	// bootstrap's re-entry test works cleanly, then append them back.
+	base := stripEnv(spec.BuildEnv(os.Environ()), bootstrapEnvVar, emulatedEnvVar)
+	env := append(base,
 		bootstrapEnvVar+"=1",
 		emulatedEnvVar+"="+strings.Join(emStrs, ","),
 	)
 
 	// argv[0] is cosmetic; argv[1:] is what the bootstrap will exec.
-	bootstrapArgv := append([]string{"mini-sentry-bootstrap", path}, args...)
+	bootstrapArgv := append([]string{"mini-sentry-bootstrap", path}, spec.Args...)
 
-	child, err := syscall.ForkExec(selfExe, bootstrapArgv, &syscall.ProcAttr{
+	procAttr := &syscall.ProcAttr{
 		Files: []uintptr{0, 1, 2, uintptr(childSock)},
 		Env:   env,
-	})
+		Dir:   spec.Cwd,
+		Sys:   &syscall.SysProcAttr{},
+	}
+	applyCredToSysProcAttr(procAttr.Sys, spec)
+	child, err := syscall.ForkExec(selfExe, bootstrapArgv, procAttr)
 	syscall.Close(childSock)
 	if err != nil {
 		syscall.Close(parentSock)
 		return -1, fmt.Errorf("fork bootstrap: %w", err)
+	}
+
+	// Apply rlimits on the bootstrap before it execves the real target.
+	// Same caveat as the ptrace platform: a few rlimits (STACK, AS) are
+	// read by the kernel during exec and may not take full effect.
+	if err := spec.applyRlimits(child); err != nil {
+		_ = syscall.Kill(child, syscall.SIGKILL)
+		var ws syscall.WaitStatus
+		syscall.Wait4(child, &ws, 0, nil)
+		syscall.Close(parentSock)
+		return -1, fmt.Errorf("apply rlimits: %w", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "  [seccomp] bootstrap pid=%d, awaiting listener fd...\n", child)

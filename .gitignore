@@ -1,6 +1,17 @@
+# Build artefacts
+sentry-exec
 mini-sentry
 cmd/guest/guest
 /guest
+
+# Cross-compiled release binaries
+release/
+mini-sentry-linux-amd64
+mini-sentry-linux-arm64
+guest-linux-amd64
+guest-linux-arm64
+
+# Compiled C samples
 samples/echo
 samples/cat
 samples/ls
@@ -8,8 +19,7 @@ samples/pwd
 samples/edges
 samples/stress
 samples/sysfuzz
+samples/httpget
+
+# Go fuzz corpus
 testdata/fuzz/
-mini-sentry-linux-amd64
-guest-linux-amd64
-mini-sentry-linux-amd64
-guest-linux-amd64

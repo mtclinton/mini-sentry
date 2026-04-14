@@ -11,5 +11,5 @@ package main
 // The Sentry and syscall handlers are identical across platforms — only
 // the interception mechanism differs.
 type Platform interface {
-	Run(program string, args ...string) (int, error)
+	Run(spec *ExecSpec) (int, error)
 }

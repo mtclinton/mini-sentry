@@ -91,7 +91,7 @@ func NewPtracePlatform(sentry *Sentry) *PtracePlatform {
 // AND exit, and actually executes the syscall), SYSEMU stops ONLY on entry
 // and SKIPS the real syscall. The kernel never sees it. This is exactly
 // what gVisor needs — the Sentry IS the kernel.
-func (p *PtracePlatform) Run(program string, args ...string) (int, error) {
+func (p *PtracePlatform) Run(spec *ExecSpec) (int, error) {
 	// CRITICAL: Lock this goroutine to an OS thread.
 	// ptrace is per-thread in Linux — all ptrace operations on a tracee
 	// must come from the same thread that attached. Go's goroutine scheduler
@@ -101,24 +101,40 @@ func (p *PtracePlatform) Run(program string, args ...string) (int, error) {
 	defer runtime.UnlockOSThread()
 
 	// Resolve the program path.
-	path, err := exec.LookPath(program)
+	path, err := exec.LookPath(spec.Program)
 	if err != nil {
-		return -1, fmt.Errorf("program not found: %s: %w", program, err)
+		return -1, fmt.Errorf("program not found: %s: %w", spec.Program, err)
 	}
 
 	// Fork the child with PTRACE_TRACEME.
 	// SysProcAttr.Ptrace = true sets PTRACE_TRACEME in the child before exec.
 	// This means the child will stop on its first instruction after exec(),
 	// giving us a chance to configure ptrace options.
-	argv := append([]string{program}, args...)
-	child, err := syscall.ForkExec(path, argv, &syscall.ProcAttr{
+	argv := append([]string{spec.Program}, spec.Args...)
+	procAttr := &syscall.ProcAttr{
 		Files: []uintptr{0, 1, 2}, // stdin, stdout, stderr pass through
+		Env:   spec.BuildEnv(os.Environ()),
+		Dir:   spec.Cwd,
 		Sys: &syscall.SysProcAttr{
 			Ptrace: true, // Child calls PTRACE_TRACEME before exec
 		},
-	})
+	}
+	applyCredToSysProcAttr(procAttr.Sys, spec)
+	child, err := syscall.ForkExec(path, argv, procAttr)
 	if err != nil {
 		return -1, fmt.Errorf("fork+exec failed: %w", err)
+	}
+
+	// Apply rlimits on the freshly-forked child. Has to happen before
+	// we resume tracing; prlimit64 is safe to call on a stopped tracee.
+	// Note: RLIMIT_STACK and RLIMIT_AS are consumed by the kernel during
+	// exec and will not fully take effect when set post-ForkExec — document
+	// this caveat rather than pretend otherwise.
+	if err := spec.applyRlimits(child); err != nil {
+		_ = syscall.Kill(child, syscall.SIGKILL)
+		var ws syscall.WaitStatus
+		syscall.Wait4(child, &ws, 0, nil)
+		return -1, fmt.Errorf("apply rlimits: %w", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "  [platform] child pid=%d, waiting for exec stop...\n", child)

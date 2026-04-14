@@ -1,4 +1,4 @@
-.PHONY: build guest run clean verbose bench samples test test-quick
+.PHONY: build guest run clean verbose bench samples test test-quick mini-sentry
 
 # Detect the host OS. On Linux, build natively. On macOS, cross-compile.
 UNAME_OS := $(shell uname -s)
@@ -29,26 +29,32 @@ PLATFORM ?= ptrace
 #   GOFER=false            — in-memory VFS inside the Sentry
 GOFER ?= true
 
-build: mini-sentry guest
+build: sentry-exec guest
 
-mini-sentry: *.go go.mod
-	$(BUILD_FLAGS) go build -o mini-sentry .
+sentry-exec: *.go go.mod
+	$(BUILD_FLAGS) go build -o sentry-exec .
+	@# Keep the old name around as a symlink so existing scripts and
+	@# blog-post command lines still resolve. `make clean` removes both.
+	@ln -sf sentry-exec mini-sentry
+
+# Back-compat alias: `make mini-sentry` builds sentry-exec too.
+mini-sentry: sentry-exec
 
 guest: cmd/guest/main.go
 	$(BUILD_FLAGS) go build -o cmd/guest/guest ./cmd/guest
 
 run: build
-	./mini-sentry --platform=$(PLATFORM) --gofer=$(GOFER) ./cmd/guest/guest
+	./sentry-exec --platform=$(PLATFORM) --gofer=$(GOFER) ./cmd/guest/guest
 
 verbose: build
-	MINI_SENTRY_VERBOSE=1 ./mini-sentry --platform=$(PLATFORM) --gofer=$(GOFER) ./cmd/guest/guest
+	MINI_SENTRY_VERBOSE=1 ./sentry-exec --platform=$(PLATFORM) --gofer=$(GOFER) ./cmd/guest/guest
 
 # Side-by-side getpid() benchmark across both platforms.
 bench: build
 	@echo "=== ptrace ==="
-	./mini-sentry --platform=ptrace --benchmark ./cmd/guest/guest 2>/dev/null | grep getpid
+	./sentry-exec --platform=ptrace --benchmark ./cmd/guest/guest 2>/dev/null | grep getpid
 	@echo "=== seccomp ==="
-	./mini-sentry --platform=seccomp --benchmark ./cmd/guest/guest 2>/dev/null | grep getpid
+	./sentry-exec --platform=seccomp --benchmark ./cmd/guest/guest 2>/dev/null | grep getpid
 
 # Static coreutils-like binaries for testing real syscall sequences.
 # Builds echo/cat/ls/pwd against glibc with -static so there's no
@@ -72,4 +78,4 @@ samples/%: samples/%.c
 	gcc -static -O2 -o $@ $<
 
 clean:
-	rm -f mini-sentry cmd/guest/guest samples/echo samples/cat samples/ls samples/pwd samples/edges samples/stress samples/sysfuzz samples/httpget
+	rm -f sentry-exec mini-sentry cmd/guest/guest samples/echo samples/cat samples/ls samples/pwd samples/edges samples/stress samples/sysfuzz samples/httpget

@@ -13,8 +13,8 @@ This is a **Linux-only** project (ptrace SYSEMU doesn't exist on macOS). Build f
 sudo apt-get update
 sudo apt-get install -y gcc libc6-dev
 
-# Build mini-sentry and the guest
-make build             # produces ./mini-sentry and ./cmd/guest/guest
+# Build sentry-exec and the guest
+make build             # produces ./sentry-exec (+ ./mini-sentry symlink) and ./cmd/guest/guest
 
 # Run the guest in the sandbox
 make run               # build + run the guest
@@ -35,24 +35,68 @@ make samples       # builds static echo/cat/ls/pwd into ./samples/
 Then run them in the sandbox:
 
 ```bash
-./mini-sentry ./samples/echo hello from sandbox
-./mini-sentry ./samples/cat /etc/hostname      # → "mini-sentry-sandbox"
-./mini-sentry ./samples/ls /                   # → greeting.txt  etc  proc
-./mini-sentry ./samples/pwd                    # → "/"
+./sentry-exec ./samples/echo hello from sandbox
+./sentry-exec ./samples/cat /etc/hostname      # → "mini-sentry-sandbox"
+./sentry-exec ./samples/ls /                   # → greeting.txt  etc  proc
+./sentry-exec ./samples/pwd                    # → "/"
 ```
 
 Everything works under `--platform=seccomp` too:
 
 ```bash
-./mini-sentry --platform=seccomp ./samples/cat /etc/os-release
+./sentry-exec --platform=seccomp ./samples/cat /etc/os-release
 ```
 
 If your distro provides `busybox-static` (`sudo apt-get install -y busybox-static` on Debian/Ubuntu) that works as well:
 
 ```bash
-./mini-sentry /bin/busybox echo hello
-./mini-sentry /bin/busybox cat /greeting.txt
+./sentry-exec /bin/busybox echo hello
+./sentry-exec /bin/busybox cat /greeting.txt
 ```
+
+### CLI knobs
+
+`sentry-exec` is intended to be called the same way you'd call `firejail`, `bubblewrap`, or `runsc do` — pass the target as trailing arguments, configure the sandbox with flags:
+
+| Flag | Description |
+|---|---|
+| `--platform ptrace\|seccomp` | Interception mechanism (default: `ptrace`) |
+| `--gofer=false` | Use an in-memory VFS inside the Sentry instead of a separate Gofer process |
+| `--mount HOST:GUEST[:ro\|:rw]` | Bind-mount a host subtree into the guest; repeatable; longest guest prefix wins |
+| `--gofer-root DIR` | Legacy shorthand for serving a single host tree read-only at `/` |
+| `--gofer-deny PATH` | Guest path prefix that always returns EACCES (repeatable) |
+| `--net-allow CIDR:PORT` | Outbound allowlist entry (repeatable) |
+| `--net-deny CIDR:PORT` | Outbound denylist entry (deny beats allow; port `0` = all) |
+| `--env KEY=VAL` | Extra env var for the guest (repeatable, last wins per key) |
+| `--cwd DIR` | Guest working directory (default: inherit) |
+| `--user NAME\|UID` | Drop to this uid before exec |
+| `--group NAME\|GID` | Drop to this gid before exec |
+| `--rlimit NAME=SOFT[:HARD]` | Override a guest rlimit (repeatable). Names: `as`, `core`, `cpu`, `data`, `fsize`, `memlock`, `msgqueue`, `nice`, `nofile`, `nproc`, `rss`, `rtprio`, `sigpending`, `stack` |
+| `--benchmark` | Run a getpid() hot loop inside the guest for platform-timing numbers |
+
+Examples:
+
+```bash
+# Run an untrusted script with tight resource limits + scrubbed env.
+./sentry-exec \
+    --rlimit nofile=64 --rlimit cpu=5 --rlimit fsize=1048576 \
+    --env PATH=/usr/bin --env HOME=/tmp \
+    ./untrusted.sh
+
+# Drop privileges and pin the working directory.
+./sentry-exec --user nobody --group nogroup --cwd / ./samples/pwd
+
+# Expose a writable scratch directory and block everything else.
+./sentry-exec \
+    --mount /tmp/scratch:/tmp:rw \
+    --gofer-deny /etc \
+    ./samples/cat /tmp/input
+```
+
+A couple of caveats worth naming outright:
+
+- **Static binaries only, for now.** Dynamic ELFs need file-backed `mmap` and a working `ld-linux-x86-64.so.2` — that's Phase 2. Use `make samples` or `busybox-static` until then.
+- **`RLIMIT_STACK` and `RLIMIT_AS` are imperfect.** Both are read by the kernel *during* `execve`. We apply limits via `prlimit64` on the child PID right after `ForkExec` returns, which is already past the initial address-space sizing. They'll clamp post-exec behaviour (further `mmap` failures) but won't shrink the initial mapping. A later pre-exec bootstrap step will close this gap.
 
 ## Architecture → gVisor Mapping
 

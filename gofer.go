@@ -30,9 +30,10 @@ import (
 )
 
 const (
-	goferEnvVar     = "MINI_SENTRY_GOFER"
-	goferRootEnvVar = "MINI_SENTRY_GOFER_ROOT"
-	goferDenyEnvVar = "MINI_SENTRY_GOFER_DENY"
+	goferEnvVar       = "MINI_SENTRY_GOFER"
+	goferRootEnvVar   = "MINI_SENTRY_GOFER_ROOT"
+	goferDenyEnvVar   = "MINI_SENTRY_GOFER_DENY"
+	goferMountsEnvVar = "MINI_SENTRY_GOFER_MOUNTS"
 
 	// goferSockFD is the fd that the parent maps the child end of the
 	// socketpair onto when it re-execs us.
@@ -63,11 +64,12 @@ func RunGoferBootstrap() {
 
 	g := newGoferServer(os.Getenv(goferRootEnvVar))
 	g.denies = parseDenyList(os.Getenv(goferDenyEnvVar))
+	g.mounts = sortMountsByGuestLen(deserializeMounts(os.Getenv(goferMountsEnvVar)))
 	seedDefaults(g.addFile)
 
 	if os.Getenv("MINI_SENTRY_VERBOSE") != "" {
-		fmt.Fprintf(os.Stderr, "[gofer] ready: %d virtual files, root=%q, deny=%v\n",
-			len(g.files), g.root, g.denies)
+		fmt.Fprintf(os.Stderr, "[gofer] ready: %d virtual files, root=%q, mounts=%d, deny=%v\n",
+			len(g.files), g.root, len(g.mounts), g.denies)
 	}
 
 	g.Serve(conn)
@@ -75,14 +77,16 @@ func RunGoferBootstrap() {
 }
 
 // goferServer holds the gofer's private view of the filesystem: the
-// in-memory virtual files, a file table for open handles, and an
-// optional host-directory root that gets layered in on lookup misses.
+// in-memory virtual files, a file table for open handles, a list of
+// mounts exposed to the guest, and an optional global root
+// (--gofer-root, back-compat shorthand for `--mount /HOST:/:ro`).
 type goferServer struct {
 	files     map[string][]byte
 	dirs      map[string][]string
 	openFiles map[uint64]*goferOpenFile
 	nextID    uint64
-	root      string   // optional host dir served read-only
+	root      string   // optional host dir served read-only (legacy)
+	mounts    []Mount  // --mount entries, longest-guest-prefix first
 	denies    []string // guest-path prefixes that always get EACCES
 }
 
@@ -176,13 +180,27 @@ func (g *goferServer) lookup(path string) ([]byte, bool) {
 }
 
 // resolveHost maps a guest path to a real host path, refusing anything
-// that escapes g.root via either literal ".." components or a symlink.
-// Returns ("", false) if the path can't be safely served.
+// that escapes the mount's host root via either literal ".." components
+// or a symlink. Returns ("", false) if the path can't be safely served.
+//
+// Lookup order:
+//  1. --mount entries, longest guest-prefix first.
+//  2. --gofer-root (legacy).
 func (g *goferServer) resolveHost(path string) (string, bool) {
+	cleaned := filepath.Clean(path)
+
+	// Try --mount entries first. They're sorted longest-first so
+	// /usr/lib/foo hits a /usr/lib mount before a / mount.
+	for _, m := range g.mounts {
+		mapped, ok := resolveWithinHostRoot(m.Host, m.Guest, cleaned)
+		if ok {
+			return mapped, true
+		}
+	}
 	if g.root == "" {
 		return "", false
 	}
-	real := filepath.Join(g.root, filepath.Clean(path))
+	real := filepath.Join(g.root, cleaned)
 	// Literal escape: "/foo/../../etc/passwd".
 	rel, err := filepath.Rel(g.root, real)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
@@ -232,10 +250,10 @@ func (g *goferServer) listDir(path string) []string {
 			}
 		}
 	}
-	// Merge in host directory entries when --gofer-root is set.
-	// Virtual wins on name collisions (seen already captures them),
-	// and denied children are filtered out so ls can't see what
-	// cat can't open.
+	// Merge in host directory entries from --mount entries and the
+	// legacy --gofer-root. Virtual files win on name collisions (seen
+	// already captures them), and denied children are filtered out so
+	// ls can't see what cat can't open.
 	if real, ok := g.resolveHost(path); ok {
 		if hostEntries, err := os.ReadDir(real); err == nil {
 			for _, e := range hostEntries {
@@ -251,6 +269,21 @@ func (g *goferServer) listDir(path string) []string {
 				seen[name] = true
 			}
 		}
+	}
+	// Mount points whose guest path is a direct child of `path` should
+	// show up in its listing even if their host side isn't resolvable
+	// or the mount host dir is empty. Example: `--mount /lib:/lib:ro`
+	// means `/` must show "lib" whether or not /lib (host) exists.
+	for _, m := range g.mounts {
+		if filepath.Dir(m.Guest) != path {
+			continue
+		}
+		name := filepath.Base(m.Guest)
+		if seen[name] {
+			continue
+		}
+		entries = append(entries, name)
+		seen[name] = true
 	}
 	if len(entries) == 0 {
 		return nil
@@ -402,7 +435,7 @@ func (g *goferServer) logOp(req *GoferRequest, resp *GoferResponse) {
 // startGofer is called from main.go to spawn the gofer child, and returns
 // a GoferVFS client connected to it. The returned cleanup function closes
 // the socket and reaps the child.
-func startGofer(goferRoot, goferDeny string) (*GoferVFS, func(), error) {
+func startGofer(goferRoot, goferDeny string, mounts []Mount) (*GoferVFS, func(), error) {
 	sp, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("socketpair: %w", err)
@@ -416,11 +449,12 @@ func startGofer(goferRoot, goferDeny string) (*GoferVFS, func(), error) {
 		return nil, nil, fmt.Errorf("os.Executable: %w", err)
 	}
 
-	env := make([]string, 0, len(os.Environ())+3)
+	env := make([]string, 0, len(os.Environ())+4)
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, goferEnvVar+"=") ||
 			strings.HasPrefix(e, goferRootEnvVar+"=") ||
-			strings.HasPrefix(e, goferDenyEnvVar+"=") {
+			strings.HasPrefix(e, goferDenyEnvVar+"=") ||
+			strings.HasPrefix(e, goferMountsEnvVar+"=") {
 			continue
 		}
 		env = append(env, e)
@@ -431,6 +465,9 @@ func startGofer(goferRoot, goferDeny string) (*GoferVFS, func(), error) {
 	}
 	if goferDeny != "" {
 		env = append(env, goferDenyEnvVar+"="+goferDeny)
+	}
+	if m := serializeMounts(mounts); m != "" {
+		env = append(env, goferMountsEnvVar+"="+m)
 	}
 
 	pid, err := syscall.ForkExec(selfExe, []string{"mini-sentry-gofer"}, &syscall.ProcAttr{
@@ -462,4 +499,45 @@ func startGofer(goferRoot, goferDeny string) (*GoferVFS, func(), error) {
 		syscall.Wait4(pid, &ws, 0, nil)
 	}
 	return client, cleanup, nil
+}
+
+// resolveWithinHostRoot maps guestPath (inside the guest's view) to a
+// real host path inside hostRoot, rejecting literal ".." escapes and
+// symlink escapes. Returns ("", false) when guestPath falls outside
+// the mount's guest subtree or points outside its host subtree.
+//
+// Pulled out as a free function so both --mount entries and the legacy
+// --gofer-root go through the same escape-check logic.
+func resolveWithinHostRoot(hostRoot, guestRoot, guestPath string) (string, bool) {
+	// Does guestPath live under guestRoot?
+	rel, err := filepath.Rel(guestRoot, guestPath)
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	real := filepath.Join(hostRoot, rel)
+
+	// Literal escape (redundant given Rel above, but cheap insurance).
+	relFromHost, err := filepath.Rel(hostRoot, real)
+	if err != nil || relFromHost == ".." ||
+		strings.HasPrefix(relFromHost, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	// Symlink escape.
+	resolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		return "", false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(hostRoot)
+	if err != nil {
+		return "", false
+	}
+	rel2, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil || rel2 == ".." ||
+		strings.HasPrefix(rel2, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return resolved, true
 }
