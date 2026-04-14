@@ -270,7 +270,7 @@ func fatalf(format string, args ...interface{}) {
 
 func printStartBanner(w *os.File, platformLabel, vfsLabel string, fileCount int, spec *ExecSpec) {
 	fmt.Fprintf(w, "\n┌─────────────────────────────────────────────────────┐\n")
-	fmt.Fprintf(w, "│  %s: userspace kernel starting              │\n", padRight(progName, 10))
+	fmt.Fprintf(w, "│  %s: userspace kernel starting             │\n", padRight(progName, 11))
 	fmt.Fprintf(w, "│  Platform: %s│\n", padRight(platformLabel, 41))
 	fmt.Fprintf(w, "│  VFS:      %s│\n", padRight(vfsLabel, 41))
 	cmd := spec.Program + " " + strings.Join(spec.Args, " ")
