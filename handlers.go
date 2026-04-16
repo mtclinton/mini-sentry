@@ -184,6 +184,24 @@ func (s *Sentry) sysPread64(pid int, sc SyscallArgs) uint64 {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// PWRITE64 — pwrite64(fd, buf, count, offset)
+//
+// Like write(), but at a given offset. We only support passthrough fds
+// (kernel-owned); virtual files are read-only.
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Sentry) sysPwrite64(pid int, sc SyscallArgs) uint64 {
+	fd := int(sc.Args[0])
+
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
+	// Virtual fds are read-only — no pwrite support.
+	return errno(syscall.EBADF)
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // WRITE — write(fd, buf, count)
 //
 // In gVisor: vfs.FileDescription.Write()
@@ -956,6 +974,155 @@ func (s *Sentry) sysFstatfs(pid int, sc SyscallArgs) uint64 {
 	binary.LittleEndian.PutUint64(buf[8:16], 4096)       // f_bsize
 	binary.LittleEndian.PutUint64(buf[16:24], 1024*1024) // f_blocks
 	binary.LittleEndian.PutUint64(buf[24:32], 1024*1024) // f_bfree
+	writeToChild(pid, bufPtr, buf[:])
+	return 0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// FADVISE64 — fadvise64(fd, offset, len, advice)
+//
+// Advisory hint about expected file access patterns. Glibc calls this
+// on nearly every fopen(). Purely advisory — the kernel is free to
+// ignore it, so returning 0 (success) is always correct.
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Sentry) sysFadvise64(_ int, sc SyscallArgs) uint64 {
+	fd := int(sc.Args[0])
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
+	// Virtual fds: accept the hint and do nothing.
+	return 0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// COPY_FILE_RANGE — copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
+//
+// Modern cat/cp try this first for zero-copy file transfer, then fall
+// back to read+write when it returns ENOSYS or EXDEV. We return ENOSYS
+// so callers use the normal path which we handle fine.
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Sentry) sysCopyFileRange(_ int, _ SyscallArgs) uint64 {
+	return errno(syscall.ENOSYS)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PRCTL — prctl(option, arg2, arg3, arg4, arg5)
+//
+// Process control. Glibc uses it during early init for things like
+// PR_SET_NAME, PR_GET_DUMPABLE, PR_SET_VMA. We handle the common
+// cases and return 0 (success) or EINVAL for unknown options.
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Sentry) sysPrctl(pid int, sc SyscallArgs) uint64 {
+	option := int(sc.Args[0])
+
+	switch option {
+	case 15: // PR_SET_NAME — set the thread name
+		return 0
+	case 16: // PR_GET_NAME — get the thread name
+		name := []byte("sandboxed\x00")
+		writeToChild(pid, sc.Args[1], name)
+		return 0
+	case 4: // PR_GET_DUMPABLE
+		return 1
+	case 3: // PR_SET_DUMPABLE
+		return 0
+	case 38: // PR_SET_NO_NEW_PRIVS
+		return 0
+	case 0x53564d41: // PR_SET_VMA (ARM64, used by some allocators)
+		return 0
+	default:
+		// Return success for unknown options — glibc often probes
+		// capabilities and ignores failure gracefully.
+		return 0
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// STATFS — statfs(path, buf)
+//
+// Returns filesystem info for a path. Glibc/coreutils use this to
+// detect filesystem types (e.g., ls checks for remote filesystems
+// to decide whether to stat() lazily).
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Sentry) sysStatfs(pid int, sc SyscallArgs) uint64 {
+	pathPtr := sc.Args[0]
+	bufPtr := sc.Args[1]
+	path := readStringFromChild(pid, pathPtr, 256)
+
+	// Check if this path is on an identity mount — passthrough.
+	cleanPath := filepath.Clean(path)
+	if hostPath, _, ok := matchMount(s.mounts, cleanPath); ok && hostPath == cleanPath {
+		s.requestPassthrough(nil)
+		return 0
+	}
+
+	// Virtual filesystem: return a tmpfs-like description.
+	var buf [120]byte
+	binary.LittleEndian.PutUint64(buf[0:8], 0x01021994)  // f_type = TMPFS_MAGIC
+	binary.LittleEndian.PutUint64(buf[8:16], 4096)       // f_bsize
+	binary.LittleEndian.PutUint64(buf[16:24], 1024*1024) // f_blocks
+	binary.LittleEndian.PutUint64(buf[24:32], 1024*1024) // f_bfree
+	writeToChild(pid, bufPtr, buf[:])
+	return 0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// STATX — statx(dirfd, pathname, flags, mask, statxbuf)
+//
+// Modern stat variant preferred by recent coreutils. For passthrough
+// paths (identity mounts) we let the kernel handle it. For VFS paths,
+// we fabricate a response from the same data doStat uses.
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Sentry) sysStatx(pid int, sc SyscallArgs) uint64 {
+	pathPtr := sc.Args[1]
+	bufPtr := sc.Args[4]
+	flags := sc.Args[2]
+	path := readStringFromChild(pid, pathPtr, 256)
+
+	// AT_EMPTY_PATH with a valid dirfd → stat the fd itself.
+	if path == "" && flags&0x1000 != 0 /* AT_EMPTY_PATH */ {
+		fd := int(sc.Args[0])
+		if s.shouldPassthroughFD(fd) {
+			s.requestPassthrough(nil)
+			return 0
+		}
+		// Fall through to fabricate a response for virtual fds.
+	} else if path != "" {
+		// Path-based: check for identity mount → passthrough.
+		cleanPath := filepath.Clean(path)
+		if hostPath, _, ok := matchMount(s.mounts, cleanPath); ok && hostPath == cleanPath {
+			s.requestPassthrough(nil)
+			return 0
+		}
+	}
+
+	// Fabricate a statx response for virtual paths.
+	// struct statx is 256 bytes on x86_64.
+	var buf [256]byte
+	// stx_mask: STATX_BASIC_STATS (0x07ff)
+	binary.LittleEndian.PutUint32(buf[0:4], 0x07ff)
+	// stx_blksize
+	binary.LittleEndian.PutUint32(buf[4:8], 4096)
+	// stx_mode: check if it's a known VFS path
+	data, eno := s.vfs.Lookup(path)
+	if eno == 0 {
+		// Regular file
+		binary.LittleEndian.PutUint16(buf[22:24], 0100644) // S_IFREG | rw-r--r--
+		binary.LittleEndian.PutUint32(buf[24:28], 1)       // stx_nlink
+		binary.LittleEndian.PutUint64(buf[40:48], uint64(len(data))) // stx_size
+	} else if entries := s.vfs.ListDir(path); entries != nil {
+		// Directory
+		binary.LittleEndian.PutUint16(buf[22:24], 040755) // S_IFDIR | rwxr-xr-x
+		binary.LittleEndian.PutUint32(buf[24:28], 2)      // stx_nlink
+	} else {
+		return errno(syscall.ENOENT)
+	}
 	writeToChild(pid, bufPtr, buf[:])
 	return 0
 }
