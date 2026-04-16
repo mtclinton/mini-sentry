@@ -85,6 +85,10 @@ func main() {
 	}
 
 	sentry := NewSentryWithPolicy(vfs, policy)
+	// Hand the mount list to the Sentry so openat/stat/faccessat can
+	// decide whether a guest path is served by the VFS (virtual) or by
+	// the real kernel (identity-mount passthrough, for ld.so + libc).
+	sentry.SetMounts(opts.mounts)
 
 	// For benchmark mode we want getpid() to actually get the "seccomp is
 	// faster" treatment — i.e., ALLOW in the filter so it never traps.

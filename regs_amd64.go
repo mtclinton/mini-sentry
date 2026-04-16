@@ -34,6 +34,14 @@ func setSyscallReturn(regs *unix.PtraceRegs, ret uint64) {
 	regs.Rax = ret
 }
 
+// getSyscallReturn reads the return value left by the kernel after a
+// passthrough syscall completes. Used by the Platform to surface the
+// real result back to the Sentry (e.g. to register kernel-allocated
+// fds returned by passthrough openat).
+func getSyscallReturn(regs *unix.PtraceRegs) uint64 {
+	return regs.Rax
+}
+
 // rewindSyscallInstruction moves RIP back to the `syscall` instruction.
 // On x86_64, `syscall` is the 2-byte opcode 0f 05. After PTRACE_SYSEMU
 // stops us at syscall entry, RIP already points past it — rewind so the

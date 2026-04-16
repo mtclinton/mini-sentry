@@ -35,6 +35,12 @@ func setSyscallReturn(regs *unix.PtraceRegs, ret uint64) {
 	regs.Regs[0] = ret
 }
 
+// getSyscallReturn reads the kernel's return value (X0) after a passthrough
+// syscall. Mirrors the amd64 version; see regs_amd64.go for the rationale.
+func getSyscallReturn(regs *unix.PtraceRegs) uint64 {
+	return regs.Regs[0]
+}
+
 // rewindSyscallInstruction moves PC back to the `svc #0` instruction.
 // On arm64, svc is 4 bytes. Required so the tracee re-executes the
 // syscall under PTRACE_SYSCALL for passthrough.

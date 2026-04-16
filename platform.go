@@ -293,7 +293,20 @@ func (p *PtracePlatform) handleSyscallStop(pid int) error {
 	if action == ActionPassthrough {
 		// The Sentry wants the real kernel to run this syscall.
 		// See passthroughSyscall for the mechanics.
-		return p.passthroughSyscall(pid, &regs)
+		if err := p.passthroughSyscall(pid, &regs); err != nil {
+			return err
+		}
+		// Read the kernel's actual return value out of RAX/X0 and hand
+		// it to the Sentry so any pending post-passthrough bookkeeping
+		// (registering kernel-allocated fds, cleaning up close entries)
+		// can complete. Safe to ignore the error here — if GETREGS fails
+		// the child is likely dying anyway and the main loop's next wait
+		// will surface it.
+		var postRegs unix.PtraceRegs
+		if err := unix.PtraceGetRegs(pid, &postRegs); err == nil {
+			p.sentry.PostPassthrough(pid, getSyscallReturn(&postRegs))
+		}
+		return nil
 	}
 
 	// Write the return value back into the child's registers.

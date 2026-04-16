@@ -20,11 +20,35 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// shouldPassthroughFD decides whether operations targeting fd must be
+// executed by the real kernel rather than the Sentry's virtual-FD logic.
+//
+// Decision rules:
+//
+//   - fd in table & isRealFD → kernel owns the real fd, passthrough.
+//   - fd in table & virtual  → Sentry handles it (stdio, VFS file, socket).
+//   - fd missing, fd < virtualFDBase → almost certainly a kernel-allocated
+//     fd from a passthrough openat (ld.so opening libc); passthrough.
+//   - fd missing, fd ≥ virtualFDBase → garbage or double-closed virtual;
+//     caller should surface EBADF.
+//
+// The virtualFDBase split is what prevents us from laundering bad fd
+// references into successful passthroughs: anything the Sentry could
+// have handed out lives at or above 10000, so the kernel never sees
+// a bogus re-close of a virtual fd.
+func (s *Sentry) shouldPassthroughFD(fd int) bool {
+	if f, ok := s.fdTable[fd]; ok {
+		return f.isRealFD
+	}
+	return fd < virtualFDBase
+}
 
 // maxTransfer caps any single ptrace-backed transfer to protect the
 // Sentry from OOM if a guest (or a fuzzer) asks for an absurd size.
@@ -42,9 +66,15 @@ func (s *Sentry) sysRead(pid int, sc SyscallArgs) uint64 {
 	buf := sc.Args[1]  // pointer in child's address space
 	count := sc.Args[2]
 
+	// Unknown or kernel-owned fd: let the real kernel do the read.
+	// Anonymous guest file fds, stdio, and virtual sockets stay here.
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	f, ok := s.fdTable[fd]
 	if !ok {
-		return errno(syscall.EBADF) // bad file descriptor
+		return errno(syscall.EBADF)
 	}
 	if count == 0 {
 		return 0
@@ -110,6 +140,50 @@ func (s *Sentry) sysRead(pid int, sc SyscallArgs) uint64 {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// PREAD64 — pread64(fd, buf, count, offset)
+//
+// Like read(), but reads at a given file offset without changing the
+// file position. The dynamic linker (ld-linux) uses pread64 heavily to
+// read ELF headers and program segments at specific offsets.
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Sentry) sysPread64(pid int, sc SyscallArgs) uint64 {
+	fd := int(sc.Args[0])
+	buf := sc.Args[1]
+	count := sc.Args[2]
+	offset := int64(sc.Args[3])
+
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
+	f, ok := s.fdTable[fd]
+	if !ok {
+		return errno(syscall.EBADF)
+	}
+	if count == 0 {
+		return 0
+	}
+
+	// Virtual file: serve data from the VFS at the requested offset,
+	// without moving the file position (unlike sysRead).
+	if offset < 0 || offset >= int64(len(f.data)) {
+		return 0 // EOF
+	}
+	capped := count
+	if capped > maxTransfer {
+		capped = maxTransfer
+	}
+	remaining := int64(len(f.data)) - offset
+	if int64(capped) > remaining {
+		capped = uint64(remaining)
+	}
+	chunk := f.data[offset : offset+int64(capped)]
+	writeToChild(pid, buf, chunk)
+	return uint64(len(chunk))
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // WRITE — write(fd, buf, count)
 //
 // In gVisor: vfs.FileDescription.Write()
@@ -120,6 +194,10 @@ func (s *Sentry) sysWrite(pid int, sc SyscallArgs) uint64 {
 	buf := sc.Args[1]
 	count := sc.Args[2]
 
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	f, ok := s.fdTable[fd]
 	if !ok {
 		return errno(syscall.EBADF)
@@ -180,6 +258,25 @@ func (s *Sentry) sysOpenat(pid int, sc SyscallArgs) uint64 {
 	// Read the pathname from the child's memory.
 	path := readStringFromChild(pid, pathPtr, 256)
 
+	// Mount check. If the path is under a --mount entry where the host
+	// and guest paths are identical, hand the openat to the real kernel.
+	// The kernel opens the file in the child's own fd namespace, so the
+	// fd number the guest sees is the one the kernel allocated. We don't
+	// register the fd in fdTable — subsequent reads/writes/fstats/mmaps
+	// against unknown fds fall through to the kernel via the
+	// shouldPassthroughFD rule (see the fd-op handlers below).
+	//
+	// Phase-2 limitation: only identity mounts (host == guest) can be
+	// passed through this way. For a rewriting mount (host != guest)
+	// we'd need to mutate the path in child memory before the kernel
+	// reads it — doable but carries TOCTTOU risk; deferred.
+	cleanPath := filepath.Clean(path)
+	if hostPath, _, ok := matchMount(s.mounts, cleanPath); ok && hostPath == cleanPath {
+		fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → passthrough (mount %s)\n", path, hostPath)
+		s.requestPassthrough(nil)
+		return 0
+	}
+
 	// Try a regular file first.
 	data, eno := s.vfs.Lookup(path)
 	if eno == 0 {
@@ -219,6 +316,21 @@ func (s *Sentry) sysOpenat(pid int, sc SyscallArgs) uint64 {
 
 func (s *Sentry) sysClose(sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
+	if s.shouldPassthroughFD(fd) {
+		// For tracked real fds (rare — openat doesn't register today, but
+		// we keep the hook for when it does), drop the bookkeeping entry
+		// once the kernel confirms the close succeeded.
+		if f, ok := s.fdTable[fd]; ok && f.isRealFD {
+			s.requestPassthrough(func(retval uint64) {
+				if int64(retval) == 0 {
+					delete(s.fdTable, fd)
+				}
+			})
+		} else {
+			s.requestPassthrough(nil)
+		}
+		return 0
+	}
 	f, ok := s.fdTable[fd]
 	if !ok {
 		return errno(syscall.EBADF)
@@ -262,6 +374,10 @@ func (s *Sentry) doStat(pid int, sc SyscallArgs, isFstat bool) uint64 {
 
 	if isFstat {
 		fd := int(sc.Args[0])
+		if s.shouldPassthroughFD(fd) {
+			s.requestPassthrough(nil)
+			return 0
+		}
 		f, ok := s.fdTable[fd]
 		if !ok {
 			return errno(syscall.EBADF)
@@ -277,13 +393,24 @@ func (s *Sentry) doStat(pid int, sc SyscallArgs, isFstat bool) uint64 {
 		path := readStringFromChild(pid, pathPtr, 256)
 		if path == "" && flags&0x1000 != 0 /* AT_EMPTY_PATH */ {
 			fd := int(sc.Args[0])
-			if f, ok := s.fdTable[fd]; ok {
-				size = int64(len(f.data))
-				isDir = f.isDir
-			} else {
+			if s.shouldPassthroughFD(fd) {
+				s.requestPassthrough(nil)
+				return 0
+			}
+			f, ok := s.fdTable[fd]
+			if !ok {
 				return errno(syscall.EBADF)
 			}
+			size = int64(len(f.data))
+			isDir = f.isDir
 		} else {
+			// Path-based stat: mount check for identity passthrough,
+			// otherwise VFS lookup.
+			cleanPath := filepath.Clean(path)
+			if hostPath, _, ok := matchMount(s.mounts, cleanPath); ok && hostPath == cleanPath {
+				s.requestPassthrough(nil)
+				return 0
+			}
 			data, eno := s.vfs.Lookup(path)
 			if eno == 0 {
 				size = int64(len(data))
@@ -330,6 +457,10 @@ func (s *Sentry) sysLseek(sc SyscallArgs) uint64 {
 	offset := int64(sc.Args[1])
 	whence := int(sc.Args[2])
 
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	f, ok := s.fdTable[fd]
 	if !ok {
 		return errno(syscall.EBADF)
@@ -356,6 +487,11 @@ func (s *Sentry) sysLseek(sc SyscallArgs) uint64 {
 // ──────────────────────────────────────────────────────────────────────
 
 func (s *Sentry) sysIoctl(sc SyscallArgs) uint64 {
+	fd := int(sc.Args[0])
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	request := sc.Args[1]
 	if request == unix.TCGETS {
 		// "Not a terminal" — this makes programs like cat skip line buffering.
@@ -372,6 +508,10 @@ func (s *Sentry) sysFcntl(sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	cmd := int(sc.Args[1])
 
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	if _, ok := s.fdTable[fd]; !ok {
 		return errno(syscall.EBADF)
 	}
@@ -398,6 +538,10 @@ func (s *Sentry) sysGetdents64(pid int, sc SyscallArgs) uint64 {
 	buf := sc.Args[1]
 	bufSize := sc.Args[2]
 
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	f, ok := s.fdTable[fd]
 	if !ok {
 		return errno(syscall.EBADF)
@@ -597,6 +741,10 @@ func (s *Sentry) sysWritev(pid int, sc SyscallArgs) uint64 {
 	iovPtr := sc.Args[1]
 	iovcnt := int(sc.Args[2])
 
+	if s.shouldPassthroughFD(fd) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	f, ok := s.fdTable[fd]
 	if !ok {
 		return errno(syscall.EBADF)
@@ -738,6 +886,10 @@ func (s *Sentry) sysUname(pid int, sc SyscallArgs) uint64 {
 
 func (s *Sentry) sysDup(sc SyscallArgs) uint64 {
 	oldFD := int(sc.Args[0])
+	if s.shouldPassthroughFD(oldFD) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	f, ok := s.fdTable[oldFD]
 	if !ok {
 		return errno(syscall.EBADF)
@@ -752,6 +904,10 @@ func (s *Sentry) sysDup(sc SyscallArgs) uint64 {
 func (s *Sentry) sysDup2(sc SyscallArgs) uint64 {
 	oldFD := int(sc.Args[0])
 	newFD := int(sc.Args[1])
+	if s.shouldPassthroughFD(oldFD) {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	f, ok := s.fdTable[oldFD]
 	if !ok {
 		return errno(syscall.EBADF)

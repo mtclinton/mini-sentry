@@ -90,6 +90,13 @@ type Sentry struct {
 	mu        sync.Mutex
 	stats     map[string]int // syscall name → count
 
+	// mounts is the list of --mount entries the Sentry can resolve
+	// without going through the in-memory VFS. Identity mounts
+	// (host == guest) are used by sysOpenat to request a kernel-side
+	// open via passthrough, so the guest ends up with a real fd the
+	// kernel owns — essential for dynamic linking (file-backed mmap).
+	mounts []Mount
+
 	// syscalls is the dispatch table. Built once in NewSentry and then
 	// read-only, so no locking is needed for lookups.
 	//
@@ -103,13 +110,30 @@ type Sentry struct {
 	//
 	// FDs 0, 1, 2 are pre-opened as stdin/stdout/stderr and passed
 	// through to the host (the Sentry's own stdin/stdout/stderr).
+	// Virtual fds allocated by sysOpenat start at virtualFDBase so
+	// they stay out of the way of kernel-assigned fds coming back
+	// from passthrough openat (the kernel hands out low numbers).
 	fdTable map[int]*OpenFile
 	nextFD  int
 
 	// brkAddr tracks the program break for brk() syscall.
 	// In gVisor, this is managed by the MemoryManager.
 	brkAddr uint64
+
+	// pendingPassthrough is set by a syscall handler to ask the Platform
+	// to execute the syscall in the real kernel after the handler
+	// returns. pendingPostPassthrough, if non-nil, is invoked under the
+	// Sentry mutex with the kernel's return value — that's how
+	// passthrough openat gets to register the fd the kernel allocated.
+	pendingPassthrough     bool
+	pendingPostPassthrough func(retval uint64)
 }
+
+// virtualFDBase is where Sentry-allocated virtual fds start. Kept well
+// above any reasonable kernel-assigned fd so the two namespaces don't
+// collide when we mix virtual opens (e.g. /greeting.txt) with
+// passthrough opens of mount paths (e.g. /lib/x86_64-linux-gnu/libc.so.6).
+const virtualFDBase = 10000
 
 // OpenFile represents an open file descriptor in the sandbox.
 // Maps to: gVisor's vfs.FileDescription
@@ -121,6 +145,13 @@ type OpenFile struct {
 	hostFD   int    // actual host FD (only if isHost)
 	writable bool
 	isDir    bool // true when this fd was opened against a directory
+
+	// isRealFD marks fds whose number was allocated by the real kernel
+	// via a passthrough openat on a mount path. Every syscall that
+	// touches one of these fds (read, write, close, fstat, lseek, fcntl,
+	// mmap) gets passed through to the kernel; the Sentry only keeps
+	// the entry around for bookkeeping (path for logs, cleanup on close).
+	isRealFD bool
 
 	// Socket state — populated when the fd represents a virtual TCP
 	// socket dialed by the Sentry on the guest's behalf. conn is nil
@@ -148,7 +179,7 @@ func NewSentryWithPolicy(vfs VFS, policy *NetPolicy) *Sentry {
 		netPolicy: policy,
 		stats:     make(map[string]int),
 		fdTable:   make(map[int]*OpenFile),
-		nextFD:    3, // 0,1,2 are reserved for stdio
+		nextFD:    virtualFDBase,
 		brkAddr:   0x10000000, // initial program break
 	}
 	// Pre-open stdio file descriptors.
@@ -183,6 +214,7 @@ func (s *Sentry) buildSyscallTable() {
 
 	// ── File operations (maps to gVisor's VFS2) ──────────────────────
 	emulated(unix.SYS_READ, "read", (*Sentry).sysRead)
+	emulated(unix.SYS_PREAD64, "pread64", (*Sentry).sysPread64)
 	emulated(unix.SYS_WRITE, "write", (*Sentry).sysWrite)
 	emulated(unix.SYS_WRITEV, "writev", (*Sentry).sysWritev)
 	emulated(unix.SYS_OPENAT, "openat", (*Sentry).sysOpenat)
@@ -269,6 +301,41 @@ func (s *Sentry) buildSyscallTable() {
 	passthrough(unix.SYS_EXIT_GROUP, "exit_group")
 }
 
+// SetMounts installs the --mount list so the Sentry can decide whether
+// a guest path should be served by the VFS or passed through to the
+// real kernel (identity mounts only, for now).
+func (s *Sentry) SetMounts(mounts []Mount) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mounts = sortMountsByGuestLen(mounts)
+}
+
+// requestPassthrough asks the Platform to run the current syscall in the
+// real kernel once the handler returns. The optional callback is invoked
+// under the Sentry mutex after the kernel responds, with the raw return
+// value — used by sysOpenat to register the fd the kernel just allocated.
+//
+// Called from within a handler (which runs under s.mu), so no locking
+// needed here.
+func (s *Sentry) requestPassthrough(cb func(retval uint64)) {
+	s.pendingPassthrough = true
+	s.pendingPostPassthrough = cb
+}
+
+// PostPassthrough is the Platform's callback after a passthrough syscall
+// completes. retval is the raw RAX/X0 the kernel produced. Safe to call
+// concurrently with other Sentry ops — acquires the mutex.
+func (s *Sentry) PostPassthrough(pid int, retval uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cb := s.pendingPostPassthrough
+	s.pendingPostPassthrough = nil
+	s.pendingPassthrough = false
+	if cb != nil {
+		cb(retval)
+	}
+}
+
 // HandleSyscall dispatches a syscall through the table.
 // This is the main entry point called by the Platform for every intercepted syscall.
 //
@@ -282,6 +349,13 @@ func (s *Sentry) buildSyscallTable() {
 func (s *Sentry) HandleSyscall(pid int, sc SyscallArgs) (uint64, SyscallAction) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Start every dispatch with a clean passthrough slate. Table-level
+	// passthrough syscalls (mmap/brk/…) don't run a handler and so
+	// wouldn't clear these otherwise, leaving stale callbacks to fire
+	// on the next syscall.
+	s.pendingPassthrough = false
+	s.pendingPostPassthrough = nil
 
 	entry, ok := s.syscalls[sc.Number]
 	if !ok {
@@ -298,7 +372,11 @@ func (s *Sentry) HandleSyscall(pid int, sc SyscallArgs) (uint64, SyscallAction) 
 		return 0, ActionPassthrough
 	}
 
-	return entry.handler(s, pid, sc), ActionReturn
+	ret := entry.handler(s, pid, sc)
+	if s.pendingPassthrough {
+		return 0, ActionPassthrough
+	}
+	return ret, ActionReturn
 }
 
 // PrintStats outputs a summary of handled syscalls.

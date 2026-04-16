@@ -12,7 +12,11 @@ package main
 // (pkg/sentry/syscalls/linux/linux64.go) where both old and new
 // syscall numbers point to the same handler function.
 
-import "golang.org/x/sys/unix"
+import (
+	"path/filepath"
+
+	"golang.org/x/sys/unix"
+)
 
 // sysFaccessat handles faccessat(dirfd, pathname, mode, flags).
 // Also handles access() on amd64 (which glibc rewrites to faccessat).
@@ -23,6 +27,14 @@ func (s *Sentry) sysFaccessat(pid int, sc SyscallArgs) uint64 {
 	// mode := sc.Args[2]
 
 	path := readStringFromChild(pid, pathPtr, 256)
+
+	// Identity-mount passthrough: same treatment as openat/stat so the
+	// dynamic linker can probe for ld.so / libc under --mount entries.
+	cleanPath := filepath.Clean(path)
+	if hostPath, _, ok := matchMount(s.mounts, cleanPath); ok && hostPath == cleanPath {
+		s.requestPassthrough(nil)
+		return 0
+	}
 	_, eno := s.vfs.Lookup(path)
 	if eno == 0 {
 		return 0
