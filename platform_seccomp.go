@@ -68,6 +68,20 @@ const (
 	bpfLD_W_ABS  = 0x20 // BPF_LD | BPF_W | BPF_ABS
 	bpfJMP_JEQ_K = 0x15 // BPF_JMP | BPF_JEQ | BPF_K
 	bpfRET_K     = 0x06 // BPF_RET | BPF_K
+
+	// SECCOMP_USER_NOTIF_FLAG_CONTINUE tells the kernel "don't apply
+	// the supervisor's return value — resume the target and let the
+	// syscall run natively". Added in Linux 5.5; x/sys/unix doesn't
+	// expose it yet. Value from <linux/seccomp.h>.
+	//
+	// Trade-off: the kernel re-reads syscall arguments from the target
+	// process after the continue, which means any path/data the Sentry
+	// inspected is subject to a TOCTTOU race with the target. gVisor
+	// avoids FLAG_CONTINUE for exactly this reason. We accept it for
+	// Phase-2 identity mounts: the target is single-threaded ld.so
+	// startup and the paths it opens are read-only, so the window is
+	// narrow and the damage ceiling is low.
+	seccompUserNotifFlagContinue = 1
 )
 
 // sockFilter matches `struct sock_filter` (8 bytes).
@@ -283,16 +297,27 @@ func (p *SeccompPlatform) notifLoop(child, listenerFD int) (int, error) {
 				Number: uint64(uint32(notif.Data.Nr)),
 				Args:   notif.Data.Args,
 			}
-			ret, _ := p.sentry.HandleSyscall(int(notif.PID), sc)
+			ret, action := p.sentry.HandleSyscall(int(notif.PID), sc)
 
 			resp := seccompNotifResp{ID: notif.ID}
-			signed := int64(ret)
-			// Negative errnos live in the small negative range; map them to
-			// resp.Error. Everything else (counts, fds, addresses) goes in val.
-			if signed < 0 && signed >= -4095 {
-				resp.Error = int32(signed)
+			if action == ActionPassthrough {
+				// Tell the kernel to just run the syscall. We can't
+				// observe the return value — unlike the ptrace platform
+				// there's no post-stop — so any post-passthrough
+				// callback the handler registered will be dropped on
+				// the floor. That's fine for Phase 2: subsequent fd
+				// operations hit shouldPassthroughFD(unknown)=true and
+				// the kernel handles them directly.
+				resp.Flags = seccompUserNotifFlagContinue
 			} else {
-				resp.Val = signed
+				signed := int64(ret)
+				// Negative errnos live in the small negative range; map them to
+				// resp.Error. Everything else (counts, fds, addresses) goes in val.
+				if signed < 0 && signed >= -4095 {
+					resp.Error = int32(signed)
+				} else {
+					resp.Val = signed
+				}
 			}
 
 			_, _, e = syscall.Syscall(syscall.SYS_IOCTL,
