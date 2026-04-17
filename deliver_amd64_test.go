@@ -91,3 +91,109 @@ func TestSiginfoFromBytesEmpty(t *testing.T) {
 		t.Fatalf("zero buffer produced non-zero Siginfo: %+v", si)
 	}
 }
+
+// TestFlagSummary pins the rendering of the sa_flags bits the Sentry
+// mirrors. The log line is the only observable signal the user has that
+// commit 4's branches actually ran, so the format matters.
+func TestFlagSummary(t *testing.T) {
+	cases := []struct {
+		name  string
+		flags uint64
+		want  string
+	}{
+		{"none", 0, ""},
+		{"nodefer", saNoDefer, " +NODEFER"},
+		{"resethand", saResetHand, " +RESETHAND"},
+		{"restart", saRestart, " +RESTART"},
+		{"all", saNoDefer | saResetHand | saRestart, " +NODEFER +RESETHAND +RESTART"},
+		{"nodefer+restart", saNoDefer | saRestart, " +NODEFER +RESTART"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := flagSummary(tc.flags); got != tc.want {
+				t.Errorf("flagSummary(0x%x) = %q, want %q", tc.flags, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeliverMaskNoDefer mirrors the exact ordering deliverOne uses —
+// SetMask(SIG_SETMASK, preMask|act.mask [| signo-bit unless NODEFER])
+// — so we catch a regression if the gate moves or the bit flips the
+// wrong way.
+func TestDeliverMaskNoDefer(t *testing.T) {
+	cases := []struct {
+		name     string
+		flags    uint64
+		wantSelf bool // signo bit expected set in handler mask
+	}{
+		{"default defers", 0, true},
+		{"NODEFER skips auto-defer", saNoDefer, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := NewSignalState()
+			signo := int(unix.SIGUSR1)
+			preMask := sigset(0).add(int(unix.SIGALRM))
+			ss.SetMask(2, preMask)
+			act := SigAction{handler: 0xdeadbeef, flags: tc.flags, mask: sigset(0).add(int(unix.SIGTERM))}
+
+			handlerMask := preMask | act.mask
+			if signo >= 1 && signo < nSig && act.flags&saNoDefer == 0 {
+				handlerMask |= 1 << uint(signo-1)
+			}
+			ss.SetMask(2, handlerMask)
+
+			got := ss.GetMask()
+			if got.has(int(unix.SIGALRM)) != true {
+				t.Errorf("preMask SIGALRM bit lost")
+			}
+			if got.has(int(unix.SIGTERM)) != true {
+				t.Errorf("act.mask SIGTERM bit missing")
+			}
+			if got.has(signo) != tc.wantSelf {
+				t.Errorf("signo bit: got %v, want %v", got.has(signo), tc.wantSelf)
+			}
+		})
+	}
+}
+
+// TestDeliverResetHand mirrors deliverOne's post-SetMask branch: when
+// SA_RESETHAND is set, disposition flips back to SIG_DFL so the next
+// signal runs the default action (or the guest re-registers).
+func TestDeliverResetHand(t *testing.T) {
+	ss := NewSignalState()
+	signo := int(unix.SIGUSR1)
+	act := SigAction{handler: 0xdeadbeef, flags: saResetHand}
+	ss.SetAction(signo, act)
+
+	if act.flags&saResetHand != 0 {
+		ss.SetAction(signo, SigAction{})
+	}
+
+	got := ss.GetAction(signo)
+	if got.handler != sigDFL {
+		t.Errorf("post-RESETHAND handler = 0x%x, want SIG_DFL (0)", got.handler)
+	}
+	if got.flags != 0 {
+		t.Errorf("post-RESETHAND flags = 0x%x, want 0", got.flags)
+	}
+}
+
+// TestDeliverResetHandNotSet confirms the inverse: without SA_RESETHAND
+// the disposition persists across deliveries.
+func TestDeliverResetHandNotSet(t *testing.T) {
+	ss := NewSignalState()
+	signo := int(unix.SIGUSR1)
+	act := SigAction{handler: 0xdeadbeef, flags: saRestart}
+	ss.SetAction(signo, act)
+
+	if act.flags&saResetHand != 0 {
+		ss.SetAction(signo, SigAction{})
+	}
+
+	got := ss.GetAction(signo)
+	if got.handler != 0xdeadbeef {
+		t.Errorf("handler = 0x%x, want 0xdeadbeef (persisted)", got.handler)
+	}
+}

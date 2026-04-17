@@ -109,14 +109,35 @@ func (p *PtracePlatform) deliverOne(pid int, sig pendingSignal, act SigAction) e
 		return fmt.Errorf("deliverOne SETREGS: %w", err)
 	}
 	handlerMask := preMask | act.mask
-	if sig.signo >= 1 && sig.signo < nSig {
+	if sig.signo >= 1 && sig.signo < nSig && act.flags&saNoDefer == 0 {
 		handlerMask |= 1 << uint(sig.signo-1)
 	}
 	p.sentry.signals.SetMask(2, handlerMask) // SIG_SETMASK
+	if act.flags&saResetHand != 0 {
+		p.sentry.signals.SetAction(sig.signo, SigAction{})
+	}
 	_, _ = fmt.Fprintf(logWriter(),
-		"  [sentry] deliver %s → handler=0x%x rsp=0x%x (preMask=0x%x)\n",
-		signalName(sig.signo), act.handler, newRsp, uint64(preMask))
+		"  [sentry] deliver %s → handler=0x%x rsp=0x%x (preMask=0x%x)%s\n",
+		signalName(sig.signo), act.handler, newRsp, uint64(preMask),
+		flagSummary(act.flags))
 	return nil
+}
+
+// flagSummary renders the sa_flags bits the Sentry mirrors into a human-
+// readable tail for the deliver log. SA_RESTART is acknowledged but not
+// acted on — we have no blocking syscall that observes it yet.
+func flagSummary(flags uint64) string {
+	var tail string
+	if flags&saNoDefer != 0 {
+		tail += " +NODEFER"
+	}
+	if flags&saResetHand != 0 {
+		tail += " +RESETHAND"
+	}
+	if flags&saRestart != 0 {
+		tail += " +RESTART"
+	}
+	return tail
 }
 
 // siginfoFromBytes deserializes a 128-byte wire-format siginfo_t into

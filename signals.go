@@ -105,6 +105,17 @@ const (
 	sigIGN = 1
 )
 
+// sa_flags bits the Sentry interprets. Values are the Linux ABI
+// constants; x/sys/unix doesn't export them on linux/amd64 as of
+// v0.28.0 so we pin them here. Bits we don't interpret (SA_RESTORER,
+// SA_ONSTACK, SA_NOCLDSTOP, SA_NOCLDWAIT, SA_SIGINFO) are still stored
+// verbatim on SigAction.flags — they're just not branched on here.
+const (
+	saNoDefer   = 0x40000000 // SA_NODEFER: don't auto-add signo to mask
+	saResetHand = 0x80000000 // SA_RESETHAND: flip to SIG_DFL after deliver
+	saRestart   = 0x10000000 // SA_RESTART: restart interrupted syscall
+)
+
 // sigactionLayout captures the per-architecture offsets within a
 // serialized kernel_sigaction struct. amd64 includes sa_restorer;
 // arm64 does not. The concrete layout is defined in regs_<arch>.go
