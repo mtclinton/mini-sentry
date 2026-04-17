@@ -304,9 +304,14 @@ func (s *Sentry) buildSyscallTable() {
 	// passthrough so the kernel's view stays authoritative. Go's
 	// runtime installs real SIGSEGV/SIGPIPE handlers with the kernel;
 	// the mirror exists so the platform wait loop can route
-	// host-delivered signals.
+	// host-delivered signals. kill/tkill/tgkill emulate self-targeted
+	// delivery by queueing a pending injection; other targets
+	// passthrough.
 	emulated(unix.SYS_RT_SIGACTION, "rt_sigaction", (*Sentry).sysRtSigaction)
 	emulated(unix.SYS_RT_SIGPROCMASK, "rt_sigprocmask", (*Sentry).sysRtSigprocmask)
+	emulated(unix.SYS_KILL, "kill", (*Sentry).sysKill)
+	emulated(unix.SYS_TKILL, "tkill", (*Sentry).sysTkill)
+	emulated(unix.SYS_TGKILL, "tgkill", (*Sentry).sysTgkill)
 	passthrough(unix.SYS_RT_SIGRETURN, "rt_sigreturn")
 	passthrough(unix.SYS_SIGALTSTACK, "sigaltstack")
 	passthrough(unix.SYS_FUTEX, "futex")
@@ -316,8 +321,6 @@ func (s *Sentry) buildSyscallTable() {
 	passthrough(unix.SYS_CLOCK_NANOSLEEP, "clock_nanosleep")
 	passthrough(unix.SYS_CLONE, "clone")
 	passthrough(unix.SYS_CLONE3, "clone3")
-	passthrough(unix.SYS_TGKILL, "tgkill")
-	passthrough(unix.SYS_KILL, "kill")
 	passthrough(unix.SYS_EXIT, "exit")
 	passthrough(unix.SYS_EXIT_GROUP, "exit_group")
 }

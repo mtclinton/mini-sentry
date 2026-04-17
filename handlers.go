@@ -1180,13 +1180,18 @@ func readStringFromChild(pid int, addr uint64, maxLen int) string {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Signal handlers (Phase 3a) — rt_sigaction / rt_sigprocmask.
+// Signal handlers (Phase 3a)
 //
-// These handlers mirror the guest's rt_sigaction / rt_sigprocmask
-// activity into s.signals. The pattern is "observe then passthrough"
-// — we decode the arguments, update our SignalState, and then
-// requestPassthrough so the kernel still installs the real handler
-// or applies the real mask change.
+// These handlers mirror the guest's rt_sigaction / rt_sigprocmask /
+// kill / tkill / tgkill activity into s.signals. The pattern is
+// "observe then passthrough" — we decode the arguments, update our
+// SignalState, and then requestPassthrough so the kernel still
+// installs the real handler or applies the real mask change. The
+// single exception is a kill() targeting the guest itself: the guest
+// believes its PID is 1 (we spoof getpid/gettid), so we rewrite the
+// target to the tracee's real host PID and fire a host kill() from
+// the Sentry thread. The kernel queues the signal as pending; on the
+// next resume our platform wait loop routes it through SignalState.
 //
 // ABI reminder (amd64 / arm64 kernel_sigaction layout):
 //
@@ -1314,3 +1319,81 @@ func (s *Sentry) sysRtSigprocmask(pid int, sc SyscallArgs) uint64 {
 	s.requestPassthrough(nil)
 	return 0
 }
+
+// sysKill — kill(pid, sig). In mini-sentry the guest always sees itself
+// as PID 1 (see SYS_GETPID emulation), so the idiomatic "raise your
+// own signal" form is kill(1, sig) or kill(getpid(), sig). We
+// recognise those and serve them without exposing the host PID
+// namespace: we call the real kernel kill() with the tracee's actual
+// PID. Other target pids passthrough unmodified (in practice the
+// guest rarely targets anything else because it only sees itself).
+func (s *Sentry) sysKill(pid int, sc SyscallArgs) uint64 {
+	targetPid := int64(sc.Args[0])
+	signum := int(sc.Args[1])
+	if targetPid == 1 || targetPid == 0 || targetPid == -1 {
+		// 1 = guest's own PID (we spoof); 0 = "send to my process
+		// group" (we're alone); -1 = "every process I can reach"
+		// (ditto, just us). In all three cases the target is the
+		// tracee itself.
+		return s.sendSelfSignal(pid, signum, "kill")
+	}
+	s.requestPassthrough(nil)
+	return 0
+}
+
+// sysTkill — tkill(tid, sig). The tracee's view of its own TID is 1
+// (see SYS_GETTID), so the same rewrite applies.
+func (s *Sentry) sysTkill(pid int, sc SyscallArgs) uint64 {
+	targetTid := int64(sc.Args[0])
+	signum := int(sc.Args[1])
+	if targetTid == 1 {
+		return s.sendSelfSignal(pid, signum, "tkill")
+	}
+	s.requestPassthrough(nil)
+	return 0
+}
+
+// sysTgkill — tgkill(tgid, tid, sig).
+func (s *Sentry) sysTgkill(pid int, sc SyscallArgs) uint64 {
+	tgid := int64(sc.Args[0])
+	tid := int64(sc.Args[1])
+	signum := int(sc.Args[2])
+	if tgid == 1 && tid == 1 {
+		return s.sendSelfSignal(pid, signum, "tgkill")
+	}
+	s.requestPassthrough(nil)
+	return 0
+}
+
+// sendSelfSignal delivers a signal to the tracee from the Sentry's
+// side of the ptrace relationship. We use the tracee's real PID (not
+// the spoofed 1 the guest sees) and a real kill() syscall — the host
+// kernel queues the signal as pending on the tracee. On the next
+// resume, the kernel will either enter signal-delivery-stop (ptrace
+// platform — we forward the signal normally) or deliver the signal
+// directly to the installed handler (seccomp platform).
+//
+// A signum of 0 is the "is this process alive" probe — we return 0
+// without sending anything, because kill(pid, 0) is the canonical
+// existence check.
+func (s *Sentry) sendSelfSignal(pid, signum int, from string) uint64 {
+	if signum == 0 {
+		return 0
+	}
+	if signum < 1 || signum >= nSig {
+		return errno(syscall.EINVAL)
+	}
+	s.signals.CountGenerated(signum)
+	if err := syscall.Kill(pid, syscall.Signal(signum)); err != nil {
+		fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d, %d): %v\n",
+			from, signalName(signum), pid, signum, err)
+		if e, ok := err.(syscall.Errno); ok {
+			return errno(e)
+		}
+		return errno(syscall.EPERM)
+	}
+	fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d) queued\n",
+		from, signalName(signum), pid)
+	return 0
+}
+
