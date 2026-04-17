@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -90,6 +91,24 @@ func main() {
 				fmt.Printf("    %s\n", line)
 			}
 		}
+	}
+	fmt.Println()
+
+	// Test 7: Exercise Phase 3a without touching Go's os/signal package,
+	// which starts a background goroutine and can spawn a new OS thread.
+	// We self-raise SIGURG, which defaults to IGN in glibc semantics but
+	// Go's runtime installs a real handler for (used for preemption).
+	// The test succeeds if we return from the kill() call without the
+	// process dying — i.e. the signal round-tripped through Sentry →
+	// host kill() → platform signal-stop → Sentry routing → forward →
+	// Go runtime handler → return.
+	fmt.Printf("Test 7 — Signals (self-raise SIGURG via Sentry)\n")
+	before := time.Now()
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGURG); err != nil {
+		fmt.Printf("  ERROR: kill(self, SIGURG): %v\n", err)
+	} else {
+		fmt.Printf("  kill(self, SIGURG) returned cleanly after %v\n",
+			time.Since(before))
 	}
 	fmt.Println()
 
