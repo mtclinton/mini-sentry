@@ -233,13 +233,63 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 				continue
 			}
 
-			// Regular signal-stop: forward the signal to the child.
-			// In gVisor, signal delivery is a whole subsystem.
-			// We just pass it through.
+			// Regular signal-stop: consult the Sentry's mirrored
+			// disposition to decide whether to forward, swallow, or
+			// let the default action take effect.
+			//
+			// Phase 3a routing:
+			//   SIGTRAP        → ptrace-related noise, drop silently.
+			//   SIG_IGN        → swallow. The kernel would suppress it
+			//                    too on its own because we passthrough
+			//                    rt_sigaction, but explicit is better —
+			//                    and a future phase 3b can drop the
+			//                    passthrough without changing this path.
+			//   blocked        → the kernel won't deliver to userspace
+			//                    anyway; we still forward so the kernel
+			//                    can queue it on the pending set.
+			//   anything else  → forward to the child. Custom handlers
+			//                    fire as they would natively.
+			//
+			// In gVisor, signal delivery is a whole subsystem — it
+			// constructs sigreturn frames, handles alternate stacks,
+			// queues signals per-thread. We lean on the host kernel
+			// for all of that in Phase 3a; our routing decision is
+			// "should the kernel see this signal at all?".
 			if sig == syscall.SIGTRAP {
 				continue // ptrace-related, don't forward
 			}
-			fmt.Fprintf(os.Stderr, "  [platform] forwarding signal %d to child\n", sig)
+			act := p.sentry.signals.GetAction(int(sig))
+			forward := true
+			reason := "default"
+			switch act.handler {
+			case sigIGN:
+				forward = false
+				reason = "SIG_IGN"
+				p.sentry.signals.countIgnored(int(sig))
+			case sigDFL:
+				// Fall through: let the kernel apply the default
+				// action (usually terminate for SIGINT/SIGTERM,
+				// coredump for SIGSEGV, ignore for SIGURG/SIGCHLD).
+				reason = "SIG_DFL"
+			default:
+				reason = fmt.Sprintf("handler=0x%x", act.handler)
+			}
+			if forward {
+				p.sentry.signals.countDelivered(int(sig))
+			}
+			fmt.Fprintf(logWriter(),
+				"  [platform] signal-stop %s (%d) → %s (%s)\n",
+				signalName(int(sig)), int(sig),
+				func() string {
+					if forward {
+						return "forward"
+					}
+					return "swallow"
+				}(),
+				reason)
+			if !forward {
+				continue
+			}
 			err = ptraceSysemu(pid, int(sig))
 			if err != nil {
 				return -1, fmt.Errorf("signal forward failed: %w", err)
@@ -249,6 +299,9 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			syscall.Wait4(pid, &ws2, 0, nil)
 			if ws2.Exited() {
 				return ws2.ExitStatus(), nil
+			}
+			if ws2.Signaled() {
+				return 128 + int(ws2.Signal()), nil
 			}
 
 		default:
