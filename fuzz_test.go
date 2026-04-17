@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // newFuzzRoot builds a tiny host directory tree the resolver can chew on:
@@ -183,6 +185,16 @@ func FuzzSyscallArgs(f *testing.F) {
 		// fuzz process.
 		entry, ok := sentry.syscalls[nr]
 		if ok && entry.passthrough {
+			return
+		}
+		// Skip emulated handlers that still touch the host on behalf of
+		// the tracee. sysKill/sysTkill/sysTgkill rewrite self-targeted
+		// calls (pid in {1, 0, -1}) into a real syscall.Kill on the
+		// tracee's host PID — which, under this fuzz harness, *is* the
+		// fuzz process. A random kill(0, SIGQUIT) would terminate the
+		// fuzz runner before it could report.
+		switch nr {
+		case unix.SYS_KILL, unix.SYS_TKILL, unix.SYS_TGKILL:
 			return
 		}
 		_, _ = sentry.HandleSyscall(self, sc)
