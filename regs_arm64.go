@@ -52,3 +52,22 @@ func rewindSyscallInstruction(regs *unix.PtraceRegs) {
 // in X8 and isn't clobbered between the SYSEMU entry stop and the next
 // execution of svc.
 func restoreSyscallNumber(regs *unix.PtraceRegs) {}
+
+// kernelSigactionSize is the wire size of struct kernel_sigaction for
+// the rt_sigaction syscall. arm64 has no sa_restorer — the kernel
+// provides the rt_sigreturn trampoline in the vDSO — so the struct is:
+//
+//   handler (8) + flags (8) + mask (8) = 24 bytes.
+//
+// See regs_amd64.go for the 32-byte variant used on x86_64.
+const kernelSigactionSize = 24
+
+// kernelSigactionLayout describes the arm64 offsets: no restorer
+// field, so the mask follows flags directly.
+var kernelSigactionLayout = sigactionLayout{
+	handlerOff:  0,
+	flagsOff:    8,
+	restorerOff: 0,
+	maskOff:     16,
+	hasRestorer: false,
+}

@@ -57,3 +57,26 @@ func rewindSyscallInstruction(regs *unix.PtraceRegs) {
 func restoreSyscallNumber(regs *unix.PtraceRegs) {
 	regs.Rax = regs.Orig_rax
 }
+
+// kernelSigactionSize is the wire size of struct kernel_sigaction as
+// the rt_sigaction syscall expects it. On amd64 this includes the
+// 8-byte sa_restorer pointer that libc fills in with its rt_sigreturn
+// trampoline address:
+//
+//   handler (8) + flags (8) + restorer (8) + mask (8) = 32 bytes.
+//
+// arm64 omits sa_restorer (the kernel provides the trampoline in the
+// vDSO) and its struct is 24 bytes — see regs_arm64.go.
+const kernelSigactionSize = 32
+
+// kernelSigactionLayout describes which offsets within a serialized
+// kernel_sigaction buffer map to which logical field. Used by
+// sysRtSigaction to decode guest-provided structs and encode the
+// mirrored old disposition back to the guest.
+var kernelSigactionLayout = sigactionLayout{
+	handlerOff:  0,
+	flagsOff:    8,
+	restorerOff: 16,
+	maskOff:     24,
+	hasRestorer: true,
+}

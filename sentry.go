@@ -299,8 +299,14 @@ func (s *Sentry) buildSyscallTable() {
 	passthrough(unix.SYS_BRK, "brk")
 	passthrough(unix.SYS_MREMAP, "mremap")
 	passthrough(unix.SYS_MADVISE, "madvise")
-	passthrough(unix.SYS_RT_SIGACTION, "rt_sigaction")
-	passthrough(unix.SYS_RT_SIGPROCMASK, "rt_sigprocmask")
+	// Signals — Phase 3a. rt_sigaction and rt_sigprocmask run our
+	// handler (which mirrors state into s.signals) and *then*
+	// passthrough so the kernel's view stays authoritative. Go's
+	// runtime installs real SIGSEGV/SIGPIPE handlers with the kernel;
+	// the mirror exists so the platform wait loop can route
+	// host-delivered signals.
+	emulated(unix.SYS_RT_SIGACTION, "rt_sigaction", (*Sentry).sysRtSigaction)
+	emulated(unix.SYS_RT_SIGPROCMASK, "rt_sigprocmask", (*Sentry).sysRtSigprocmask)
 	passthrough(unix.SYS_RT_SIGRETURN, "rt_sigreturn")
 	passthrough(unix.SYS_SIGALTSTACK, "sigaltstack")
 	passthrough(unix.SYS_FUTEX, "futex")

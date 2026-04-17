@@ -1179,3 +1179,138 @@ func readStringFromChild(pid int, addr uint64, maxLen int) string {
 	return string(buf)
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Signal handlers (Phase 3a) — rt_sigaction / rt_sigprocmask.
+//
+// These handlers mirror the guest's rt_sigaction / rt_sigprocmask
+// activity into s.signals. The pattern is "observe then passthrough"
+// — we decode the arguments, update our SignalState, and then
+// requestPassthrough so the kernel still installs the real handler
+// or applies the real mask change.
+//
+// ABI reminder (amd64 / arm64 kernel_sigaction layout):
+//
+//   struct kernel_sigaction {
+//       void     *sa_handler;    // +0,  8 bytes
+//       unsigned long sa_flags;  // +8,  8 bytes
+//       void     *sa_restorer;   // +16, 8 bytes  (only on arches with SA_RESTORER)
+//       sigset_t  sa_mask;       // +24, 8 bytes  (1 word == 64 bits on Linux)
+//   };
+//
+// Total: 32 bytes. struct sigaction (the glibc layout) differs —
+// sa_mask is padded to 128 bytes on glibc — but the *syscall* always
+// takes the kernel layout because the kernel defines the ABI.
+//
+// rt_sigaction also takes a trailing sigsetsize argument to
+// distinguish the kernel ABI (8) from legacy (longer) layouts. We
+// accept any value that fits — correctness is up to the kernel on
+// passthrough.
+// ──────────────────────────────────────────────────────────────────────
+
+// sysRtSigaction — record the new disposition, write the old one back
+// if requested, then passthrough so the kernel installs the handler
+// for real.
+//
+//   int rt_sigaction(int signum,
+//                    const struct kernel_sigaction *act,
+//                    struct kernel_sigaction *oldact,
+//                    size_t sigsetsize);
+//
+// The wire layout of struct kernel_sigaction differs between amd64 and
+// arm64 (amd64 has sa_restorer, arm64 doesn't); we look up the offsets
+// from the per-arch kernelSigactionLayout and size from
+// kernelSigactionSize defined in regs_<arch>.go.
+func (s *Sentry) sysRtSigaction(pid int, sc SyscallArgs) uint64 {
+	signum := int(sc.Args[0])
+	actPtr := sc.Args[1]
+	oldactPtr := sc.Args[2]
+	layout := kernelSigactionLayout
+
+	// Capture the old disposition *before* we let the new one land.
+	// We need it for the oldact write-back below — the kernel will
+	// clobber its copy during passthrough.
+	old := s.signals.GetAction(signum)
+
+	if actPtr != 0 {
+		buf := readFromChild(pid, actPtr, kernelSigactionSize)
+		if len(buf) >= kernelSigactionSize {
+			newAct := SigAction{
+				handler: binary.LittleEndian.Uint64(buf[layout.handlerOff : layout.handlerOff+8]),
+				flags:   binary.LittleEndian.Uint64(buf[layout.flagsOff : layout.flagsOff+8]),
+				mask:    sigset(binary.LittleEndian.Uint64(buf[layout.maskOff : layout.maskOff+8])),
+			}
+			if layout.hasRestorer {
+				newAct.restorer = binary.LittleEndian.Uint64(buf[layout.restorerOff : layout.restorerOff+8])
+			}
+			s.signals.SetAction(signum, newAct)
+			fmt.Fprintf(logWriter(), "  [sentry] rt_sigaction: %s -> %s\n",
+				signalName(signum), newAct.String())
+		}
+	}
+
+	if oldactPtr != 0 {
+		// Write our mirrored previous disposition to *oldact. This
+		// matches what the kernel would write, because we've been
+		// keeping the mirror in sync on every successful call.
+		buf := make([]byte, kernelSigactionSize)
+		binary.LittleEndian.PutUint64(buf[layout.handlerOff:layout.handlerOff+8], old.handler)
+		binary.LittleEndian.PutUint64(buf[layout.flagsOff:layout.flagsOff+8], old.flags)
+		binary.LittleEndian.PutUint64(buf[layout.maskOff:layout.maskOff+8], uint64(old.mask))
+		if layout.hasRestorer {
+			binary.LittleEndian.PutUint64(buf[layout.restorerOff:layout.restorerOff+8], old.restorer)
+		}
+		writeToChild(pid, oldactPtr, buf)
+	}
+
+	// Passthrough so Go's runtime actually has the handler installed
+	// with the kernel — otherwise SIGSEGV on a nil deref would be a
+	// silent black hole. On return, we don't need to read anything
+	// back: the kernel's oldact write we pre-empted with our own
+	// mirrored copy above.
+	s.requestPassthrough(nil)
+	return 0
+}
+
+// sysRtSigprocmask — update the Sentry-side mask mirror, then
+// passthrough.
+//
+//   int rt_sigprocmask(int how, const sigset_t *set,
+//                      sigset_t *oldset, size_t sigsetsize);
+//
+// how: SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2.
+func (s *Sentry) sysRtSigprocmask(pid int, sc SyscallArgs) uint64 {
+	how := int(sc.Args[0])
+	setPtr := sc.Args[1]
+	oldsetPtr := sc.Args[2]
+
+	// The "read current mask" case is just (set==NULL, oldset!=NULL).
+	// We still pass it through but update our mirror for symmetry.
+	var newSet sigset
+	if setPtr != 0 {
+		buf := readFromChild(pid, setPtr, 8)
+		if len(buf) >= 8 {
+			newSet = sigset(binary.LittleEndian.Uint64(buf))
+		}
+	}
+
+	var oldMask sigset
+	if setPtr != 0 {
+		oldMask = s.signals.SetMask(how, newSet)
+	} else {
+		oldMask = s.signals.GetMask()
+	}
+	fmt.Fprintf(logWriter(), "  [sentry] rt_sigprocmask: how=%d set=0x%x -> mask=0x%x\n",
+		how, uint64(newSet), uint64(s.signals.GetMask()))
+
+	if oldsetPtr != 0 {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(oldMask))
+		writeToChild(pid, oldsetPtr, buf[:])
+	}
+
+	// Passthrough so the kernel applies the mask change for real.
+	// Signal delivery still happens kernel-side in Phase 3a; the
+	// mirror is only for platform routing visibility.
+	s.requestPassthrough(nil)
+	return 0
+}
