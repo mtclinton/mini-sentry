@@ -127,6 +127,14 @@ type Sentry struct {
 	// passthrough openat gets to register the fd the kernel allocated.
 	pendingPassthrough     bool
 	pendingPostPassthrough func(retval uint64)
+
+	// signals is the Sentry's mirror of the tracee's signal disposition
+	// table and mask. Phase 3a records state here but still passthroughs
+	// rt_sigaction/rt_sigprocmask so the kernel's copy stays
+	// authoritative — the mirror exists so the platform wait loop can
+	// route host-delivered signals without asking the kernel what the
+	// tracee installed.
+	signals *SignalState
 }
 
 // virtualFDBase is where Sentry-allocated virtual fds start. Kept well
@@ -181,6 +189,7 @@ func NewSentryWithPolicy(vfs VFS, policy *NetPolicy) *Sentry {
 		fdTable:   make(map[int]*OpenFile),
 		nextFD:    virtualFDBase,
 		brkAddr:   0x10000000, // initial program break
+		signals:   NewSignalState(),
 	}
 	// Pre-open stdio file descriptors.
 	// These pass through to the host — the sandbox can write to stdout.
