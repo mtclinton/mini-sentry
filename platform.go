@@ -182,6 +182,26 @@ func (p *PtracePlatform) Run(spec *ExecSpec) (int, error) {
 // signal forwarding and multi-thread support.
 func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 	for {
+		// Drain Sentry-queued signals before resuming. Phase 3b
+		// commit 3 (ADR 001 §3) makes the Sentry authoritative for
+		// signal delivery: sendSelfSignal and the signal-stop branch
+		// below enqueue onto SignalState.pending, and this drain is
+		// where frames actually get built. The drain is cheap when
+		// the queue is empty — one atomic DequeueUnblocked lookup.
+		if res, err := p.deliverPending(pid); err != nil {
+			return -1, fmt.Errorf("signal drain: %w", err)
+		} else if res.terminate != 0 {
+			// SIG_DFL terminate hit the queue. We don't try to
+			// forward the original signal (the tracee is stopped
+			// by ptrace; its next-resume semantics are messy);
+			// SIGKILL is unblockable and produces a deterministic
+			// wait status.
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			_, _ = fmt.Fprintf(logWriter(),
+				"  [sentry] SIG_DFL terminate %s → SIGKILL\n",
+				signalName(res.terminate))
+		}
+
 		// Resume the child with PTRACE_SYSEMU.
 		// SYSEMU = stop at next syscall entry, but DON'T execute it.
 		// The kernel skips the syscall entirely — we are the kernel now.
@@ -233,75 +253,19 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 				continue
 			}
 
-			// Regular signal-stop: consult the Sentry's mirrored
-			// disposition to decide whether to forward, swallow, or
-			// let the default action take effect.
-			//
-			// Phase 3a routing:
-			//   SIGTRAP        → ptrace-related noise, drop silently.
-			//   SIG_IGN        → swallow. The kernel would suppress it
-			//                    too on its own because we passthrough
-			//                    rt_sigaction, but explicit is better —
-			//                    and a future phase 3b can drop the
-			//                    passthrough without changing this path.
-			//   blocked        → the kernel won't deliver to userspace
-			//                    anyway; we still forward so the kernel
-			//                    can queue it on the pending set.
-			//   anything else  → forward to the child. Custom handlers
-			//                    fire as they would natively.
-			//
-			// In gVisor, signal delivery is a whole subsystem — it
-			// constructs sigreturn frames, handles alternate stacks,
-			// queues signals per-thread. We lean on the host kernel
-			// for all of that in Phase 3a; our routing decision is
-			// "should the kernel see this signal at all?".
+			// Regular signal-stop: handed off to the arch-specific
+			// routine. Phase 3b commit 3 on amd64 enqueues onto the
+			// Sentry's pending queue so the top-of-loop drain builds
+			// the rt_sigframe and redirects RIP (ADR 001 §3). arm64
+			// keeps Phase 3a behavior — forward to the kernel, let it
+			// deliver — until arm64 gets its own frame builder (3c).
 			if sig == syscall.SIGTRAP {
 				continue // ptrace-related, don't forward
 			}
-			act := p.sentry.signals.GetAction(int(sig))
-			forward := true
-			var reason string
-			switch act.handler {
-			case sigIGN:
-				forward = false
-				reason = "SIG_IGN"
-				p.sentry.signals.countIgnored(int(sig))
-			case sigDFL:
-				// Fall through: let the kernel apply the default
-				// action (usually terminate for SIGINT/SIGTERM,
-				// coredump for SIGSEGV, ignore for SIGURG/SIGCHLD).
-				reason = "SIG_DFL"
-			default:
-				reason = fmt.Sprintf("handler=0x%x", act.handler)
-			}
-			if forward {
-				p.sentry.signals.countDelivered(int(sig))
-			}
-			_, _ = fmt.Fprintf(logWriter(),
-				"  [platform] signal-stop %s (%d) → %s (%s)\n",
-				signalName(int(sig)), int(sig),
-				func() string {
-					if forward {
-						return "forward"
-					}
-					return "swallow"
-				}(),
-				reason)
-			if !forward {
-				continue
-			}
-			err = ptraceSysemu(pid, int(sig))
-			if err != nil {
-				return -1, fmt.Errorf("signal forward failed: %w", err)
-			}
-			// Skip the SYSEMU at top of loop since we just resumed
-			var ws2 syscall.WaitStatus
-			_, _ = syscall.Wait4(pid, &ws2, 0, nil)
-			if ws2.Exited() {
-				return ws2.ExitStatus(), nil
-			}
-			if ws2.Signaled() {
-				return 128 + int(ws2.Signal()), nil
+			if code, terminated, err := p.handleSignalStop(pid, sig); err != nil {
+				return -1, err
+			} else if terminated {
+				return code, nil
 			}
 
 		default:

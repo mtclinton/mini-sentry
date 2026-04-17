@@ -1375,17 +1375,22 @@ func (s *Sentry) sysTgkill(pid int, sc SyscallArgs) uint64 {
 	return 0
 }
 
-// sendSelfSignal delivers a signal to the tracee from the Sentry's
-// side of the ptrace relationship. We use the tracee's real PID (not
-// the spoofed 1 the guest sees) and a real kill() syscall — the host
-// kernel queues the signal as pending on the tracee. On the next
-// resume, the kernel will either enter signal-delivery-stop (ptrace
-// platform — we forward the signal normally) or deliver the signal
-// directly to the installed handler (seccomp platform).
+// sendSelfSignal queues a self-targeted signal onto SignalState.pending.
+// The platform wait loop drains the queue at the next resume point —
+// Sentry-side delivery builds the rt_sigframe and redirects the
+// tracee's RIP to the installed handler (deliver_amd64.go). Phase
+// 3b commit 3 replaces the earlier Phase 3a behavior, which issued a
+// real host kill() and relied on the kernel to build the frame.
 //
 // A signum of 0 is the "is this process alive" probe — we return 0
-// without sending anything, because kill(pid, 0) is the canonical
-// existence check.
+// without queueing anything, matching kill(pid, 0) semantics.
+//
+// We fabricate a minimal SI_USER-shaped siginfo (si_signo, si_code,
+// si_pid, si_uid). That's what the kernel would write for a kill(2)
+// from a sibling process; on delivery the tracee sees a siginfo_t
+// consistent with the self-raise origin. "pid" here is the spoofed
+// tgid=1 and "uid" is 0 because that's what the guest sees via our
+// getpid/getuid handlers.
 func (s *Sentry) sendSelfSignal(pid, signum int, from string) uint64 {
 	if signum == 0 {
 		return 0
@@ -1394,16 +1399,42 @@ func (s *Sentry) sendSelfSignal(pid, signum int, from string) uint64 {
 		return errno(syscall.EINVAL)
 	}
 	s.signals.CountGenerated(signum)
-	if err := syscall.Kill(pid, syscall.Signal(signum)); err != nil {
-		_, _ = fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d, %d): %v\n",
-			from, signalName(signum), pid, signum, err)
-		if e, ok := err.(syscall.Errno); ok {
-			return errno(e)
+	if s.useHostSignalDelivery {
+		// Seccomp platform: no ptrace, no drain. Fall back to a real
+		// host kill — the kernel builds the frame and delivers. This
+		// matches pre-3b behavior on seccomp and keeps self-kill
+		// tests like guest/main.go Test 7 working there.
+		if err := syscall.Kill(pid, syscall.Signal(signum)); err != nil {
+			if e, ok := err.(syscall.Errno); ok {
+				return errno(e)
+			}
+			return errno(syscall.EPERM)
 		}
-		return errno(syscall.EPERM)
+		_, _ = fmt.Fprintf(logWriter(),
+			"  [sentry] %s(self, %s) -> host kill (seccomp)\n",
+			from, signalName(signum))
+		return 0
 	}
-	_, _ = fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d) queued\n",
-		from, signalName(signum), pid)
+	info := buildSelfSiginfo(signum)
+	s.signals.Enqueue(signum, info)
+	_, _ = fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> enqueued\n",
+		from, signalName(signum))
 	return 0
+}
+
+// buildSelfSiginfo fabricates the 128-byte siginfo_t the kernel would
+// write for a sibling-process kill(2). Layout on both amd64 and arm64:
+//
+//	si_signo (i32) | si_errno (i32) | si_code (i32) | pad(4) |
+//	si_pid   (i32) | si_uid   (u32) | ... (rest zero) ...
+//
+// si_code = SI_USER = 0; si_pid = the tgid the guest sees (1); si_uid = 0.
+func buildSelfSiginfo(signum int) [sigInfoBytes]byte {
+	var info [sigInfoBytes]byte
+	binary.LittleEndian.PutUint32(info[0:4], uint32(signum))
+	// si_errno (offset 4) and si_code (offset 8) stay zero: SI_USER == 0.
+	binary.LittleEndian.PutUint32(info[16:20], 1) // si_pid: guest sees tgid 1
+	binary.LittleEndian.PutUint32(info[20:24], 0) // si_uid: guest runs as root
+	return info
 }
 

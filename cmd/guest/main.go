@@ -20,6 +20,7 @@ import (
 	"os"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 func main() {
@@ -94,21 +95,25 @@ func main() {
 	}
 	fmt.Println()
 
-	// Test 7: Exercise Phase 3a without touching Go's os/signal package,
-	// which starts a background goroutine and can spawn a new OS thread.
-	// We self-raise SIGURG, which defaults to IGN in glibc semantics but
-	// Go's runtime installs a real handler for (used for preemption).
-	// The test succeeds if we return from the kill() call without the
-	// process dying — i.e. the signal round-tripped through Sentry →
-	// host kill() → platform signal-stop → Sentry routing → forward →
-	// Go runtime handler → return.
-	fmt.Printf("Test 7 — Signals (self-raise SIGURG via Sentry)\n")
-	before := time.Now()
-	if err := syscall.Kill(syscall.Getpid(), syscall.SIGURG); err != nil {
-		fmt.Printf("  ERROR: kill(self, SIGURG): %v\n", err)
+	// Test 7: Exercise Sentry-side signal delivery (Phase 3b commit 3)
+	// via the SIG_IGN drop path. Go's runtime installs its own handler
+	// for SIGURG with SA_ONSTACK — which commit 3 can't emulate yet
+	// (ADR 001 punts alt-stack awareness to 3c). So we bypass Go's
+	// os/signal machinery and raw-syscall rt_sigaction(SIG_IGN) for
+	// SIGUSR1, then kill(self, SIGUSR1). The Sentry's pending queue
+	// drain sees the mirrored SIG_IGN disposition and drops the entry
+	// quietly — kill() returns 0 and execution continues.
+	fmt.Printf("Test 7 — Signals (SIG_IGN drop via Sentry queue)\n")
+	if err := installSigIgn(syscall.SIGUSR1); err != nil {
+		fmt.Printf("  ERROR: rt_sigaction(SIGUSR1, SIG_IGN): %v\n", err)
 	} else {
-		fmt.Printf("  kill(self, SIGURG) returned cleanly after %v\n",
-			time.Since(before))
+		before := time.Now()
+		if err := syscall.Kill(syscall.Getpid(), syscall.SIGUSR1); err != nil {
+			fmt.Printf("  ERROR: kill(self, SIGUSR1): %v\n", err)
+		} else {
+			fmt.Printf("  kill(self, SIGUSR1) returned cleanly after %v\n",
+				time.Since(before))
+		}
 	}
 	fmt.Println()
 
@@ -116,6 +121,34 @@ func main() {
 	fmt.Println("║  All tests complete!                             ║")
 	fmt.Println("║  The host kernel never saw any of our syscalls.  ║")
 	fmt.Println("╚══════════════════════════════════════════════════╝")
+}
+
+// sigactionKernel matches the 8-byte-sigset kernel ABI for
+// rt_sigaction — distinct from glibc's padded struct.
+type sigactionKernel struct {
+	Handler  uintptr
+	Flags    uint64
+	Restorer uintptr
+	Mask     uint64
+}
+
+// installSigIgn raw-issues rt_sigaction to set SIG_IGN for sig,
+// bypassing Go's os/signal machinery (which would re-register a
+// SA_ONSTACK handler the Sentry can't yet forge onto the alt stack).
+// The Sentry's rt_sigaction handler mirrors the disposition so the
+// pending-queue drain will short-circuit to the SIG_IGN branch.
+func installSigIgn(sig syscall.Signal) error {
+	act := sigactionKernel{Handler: 1} // SIG_IGN
+	_, _, e := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION,
+		uintptr(sig),
+		uintptr(unsafe.Pointer(&act)),
+		0,
+		8, // sigsetsize
+		0, 0)
+	if e != 0 {
+		return e
+	}
+	return nil
 }
 
 func splitLines(s string) []string {

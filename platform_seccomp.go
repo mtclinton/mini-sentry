@@ -167,6 +167,15 @@ func (p *SeccompPlatform) Run(spec *ExecSpec) (int, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// Phase 3b's Sentry-driven signal delivery needs a ptrace relationship
+	// (GETREGS/SETREGS to install an rt_sigframe on the tracee's stack).
+	// Seccomp-notify has no such relationship, so flip sendSelfSignal back
+	// to a host kill(2). External signals still reach the child through the
+	// kernel's normal delivery path — we just can't observe or reshape them.
+	p.sentry.UseHostSignalDelivery()
+	_, _ = fmt.Fprintln(logWriter(),
+		"  [seccomp] Sentry signal delivery disabled; self-signals via host kill(2)")
+
 	path, err := exec.LookPath(spec.Program)
 	if err != nil {
 		return -1, fmt.Errorf("program not found: %s: %w", spec.Program, err)

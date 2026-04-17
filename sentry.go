@@ -150,6 +150,14 @@ type Sentry struct {
 	// route host-delivered signals without asking the kernel what the
 	// tracee installed.
 	signals *SignalState
+
+	// useHostSignalDelivery is set by the seccomp platform at startup.
+	// When true, sendSelfSignal falls back to a real host kill(2) (the
+	// Phase 3a behavior) instead of enqueueing onto SignalState.pending:
+	// under seccomp there's no ptrace relationship, so the queue has no
+	// one to drain it, and nothing would ever get delivered. The ptrace
+	// platform leaves this false and owns its own delivery loop.
+	useHostSignalDelivery bool
 }
 
 // virtualFDBase is where Sentry-allocated virtual fds start. Kept well
@@ -342,6 +350,15 @@ func (s *Sentry) buildSyscallTable() {
 	passthrough(unix.SYS_CLONE3, "clone3")
 	passthrough(unix.SYS_EXIT, "exit")
 	passthrough(unix.SYS_EXIT_GROUP, "exit_group")
+}
+
+// UseHostSignalDelivery flips sendSelfSignal into "issue a real
+// host kill(2)" mode. Called by the seccomp platform before the
+// notification loop starts; the ptrace platform never calls it.
+func (s *Sentry) UseHostSignalDelivery() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.useHostSignalDelivery = true
 }
 
 // SetMounts installs the --mount list so the Sentry can decide whether

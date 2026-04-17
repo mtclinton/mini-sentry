@@ -135,11 +135,17 @@ type SignalState struct {
 	// delivery. Matches what the guest last set via rt_sigprocmask.
 	mask sigset
 
+	// pending is the FIFO of signals queued for Sentry-driven delivery.
+	// Enqueue appends; DequeueUnblocked pops the first entry that isn't
+	// currently masked. Unblockable signals (SIGKILL/SIGSTOP) bypass
+	// the mask check in DequeueUnblocked.
+	pending []pendingSignal
+
 	// counters for observability.
-	delivered  map[int]int // signum → times actually forwarded to guest
-	ignored    map[int]int // signum → times suppressed by SIG_IGN mirror
-	generated  map[int]int // signum → times guest sent a signal via kill/tkill
-	installed  map[int]int // signum → times a new handler was installed
+	delivered map[int]int // signum → times actually forwarded to guest
+	ignored   map[int]int // signum → times suppressed by SIG_IGN mirror
+	generated map[int]int // signum → times guest sent a signal via kill/tkill
+	installed map[int]int // signum → times a new handler was installed
 }
 
 // NewSignalState returns an empty SignalState. All dispositions default
