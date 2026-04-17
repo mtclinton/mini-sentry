@@ -123,7 +123,9 @@ func (v *GoferVFS) Lookup(path string) ([]byte, syscall.Errno) {
 		offset += int64(len(rr.Data))
 	}
 
-	v.rpc(&GoferRequest{Op: OpClose, FileID: fileID})
+	// Best-effort close — we already have the data; a close failure
+	// leaks a handle on the gofer side but doesn't change the result.
+	_, _ = v.rpc(&GoferRequest{Op: OpClose, FileID: fileID})
 	return data, 0
 }
 

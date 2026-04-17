@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"strconv"
 	"strings"
@@ -88,7 +87,8 @@ func (s *ExecSpec) BuildEnv(base []string) []string {
 				filtered = append(filtered, existing)
 			}
 		}
-		out = append(filtered, e)
+		filtered = append(filtered, e)
+		out = filtered
 	}
 	return out
 }
@@ -249,31 +249,6 @@ func (s *stringSliceFlag) Values() []string {
 	}
 	return s.values
 }
-
-// mustLookPath is a thin wrapper around exec.LookPath that prints a
-// useful error and exits. The guest program path has to resolve before
-// we bother forking or spawning a Gofer.
-func mustLookPath(prog string) string {
-	if strings.ContainsRune(prog, '/') {
-		// Absolute or relative path — let it stand; stat-check so we
-		// fail fast with a sensible message instead of deep in ptrace.
-		if _, err := os.Stat(prog); err != nil {
-			fmt.Fprintf(os.Stderr, "sentry-exec: %v\n", err)
-			os.Exit(1)
-		}
-		return prog
-	}
-	// Bare name — PATH lookup.
-	path, err := lookPath(prog)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sentry-exec: %v\n", err)
-		os.Exit(1)
-	}
-	return path
-}
-
-// Indirect so tests can stub.
-var lookPath = exec.LookPath
 
 // stripEnv returns a copy of env with every entry whose KEY matches
 // one of the supplied names removed. Used by the seccomp platform to

@@ -1,4 +1,4 @@
-.PHONY: build guest run clean verbose bench samples test test-quick mini-sentry
+.PHONY: build guest run clean verbose bench samples test test-quick lint check mini-sentry
 
 # Detect the host OS. On Linux, build natively. On macOS, cross-compile.
 UNAME_OS := $(shell uname -s)
@@ -73,6 +73,19 @@ test:
 # Quick CI-friendly smoke: 5-second fuzzing, everything else at full rigor.
 test-quick:
 	FUZZTIME=5s ./test_all.sh
+
+# Static analysis via golangci-lint. Config lives in .golangci.yml.
+# Install with:
+#   curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+#     | sh -s -- -b $$(go env GOPATH)/bin
+GOLANGCI_LINT ?= $(shell go env GOPATH)/bin/golangci-lint
+lint:
+	$(GOLANGCI_LINT) run ./...
+
+# Pre-commit gate: lint + go test. Does NOT run the full ./test_all.sh
+# harness — that's test-quick's job.
+check: lint
+	go test ./...
 
 samples/%: samples/%.c
 	gcc -static -O2 -o $@ $<

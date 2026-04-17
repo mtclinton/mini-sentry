@@ -255,7 +255,7 @@ func (s *Sentry) sysConnect(pid int, sc SyscallArgs) uint64 {
 	}
 
 	if !s.netPolicy.Allowed(ip, port) {
-		fmt.Fprintf(logWriter(), "  [sentry] connect(%s:%d) → EACCES (policy)\n", ip, port)
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] connect(%s:%d) → EACCES (policy)\n", ip, port)
 		return errno(syscall.EACCES)
 	}
 
@@ -266,14 +266,14 @@ func (s *Sentry) sysConnect(pid int, sc SyscallArgs) uint64 {
 	conn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	s.mu.Lock()
 	if err != nil {
-		fmt.Fprintf(logWriter(), "  [sentry] connect(%s) → ECONNREFUSED (%v)\n", dest, err)
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] connect(%s) → ECONNREFUSED (%v)\n", dest, err)
 		return errno(syscall.ECONNREFUSED)
 	}
 
 	// fdTable can mutate while we drop the lock for the dial; re-fetch.
 	f, ok = s.fdTable[fd]
 	if !ok || !f.isSocket {
-		conn.Close()
+		_ = conn.Close()
 		return errno(syscall.EBADF)
 	}
 	f.conn = conn
@@ -283,7 +283,7 @@ func (s *Sentry) sysConnect(pid int, sc SyscallArgs) uint64 {
 		f.localIP = la.IP
 		f.localPort = la.Port
 	}
-	fmt.Fprintf(logWriter(), "  [sentry] connect fd=%d → %s ok\n", fd, dest)
+	_, _ = fmt.Fprintf(logWriter(), "  [sentry] connect fd=%d → %s ok\n", fd, dest)
 	return 0
 }
 

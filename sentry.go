@@ -349,6 +349,9 @@ func (s *Sentry) requestPassthrough(cb func(retval uint64)) {
 // PostPassthrough is the Platform's callback after a passthrough syscall
 // completes. retval is the raw RAX/X0 the kernel produced. Safe to call
 // concurrently with other Sentry ops — acquires the mutex.
+//
+//nolint:unparam // pid kept in the signature so both platforms can
+// share the callback shape; seccomp may need it for per-tracee state.
 func (s *Sentry) PostPassthrough(pid int, retval uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -385,14 +388,14 @@ func (s *Sentry) HandleSyscall(pid int, sc SyscallArgs) (uint64, SyscallAction) 
 	if !ok {
 		name := fmt.Sprintf("syscall_%d", sc.Number)
 		s.stats[name]++
-		fmt.Fprintf(logWriter(), "  [sentry] ENOSYS: %s (#%d) — not implemented\n", name, sc.Number)
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] ENOSYS: %s (#%d) — not implemented\n", name, sc.Number)
 		return errno(syscall.ENOSYS), ActionReturn
 	}
 
 	s.stats[entry.name]++
 
 	if entry.passthrough {
-		fmt.Fprintf(logWriter(), "  [sentry] passthrough: %s (#%d)\n", entry.name, sc.Number)
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] passthrough: %s (#%d)\n", entry.name, sc.Number)
 		return 0, ActionPassthrough
 	}
 
@@ -412,8 +415,8 @@ func (s *Sentry) PrintStats(w io.Writer) {
 	for _, count := range s.stats {
 		total += count
 	}
-	fmt.Fprintf(w, "│  Syscalls intercepted: %-29d│\n", total)
-	fmt.Fprintf(w, "│  Breakdown:                                         │\n")
+	_, _ = fmt.Fprintf(w, "│  Syscalls intercepted: %-29d│\n", total)
+	_, _ = fmt.Fprintf(w, "│  Breakdown:                                         │\n")
 
 	// Sort by count (simple selection — it's a small map)
 	type entry struct {
@@ -432,7 +435,7 @@ func (s *Sentry) PrintStats(w io.Writer) {
 		}
 	}
 	for _, e := range entries {
-		fmt.Fprintf(w, "│    %-20s %5d                       │\n", e.name, e.count)
+		_, _ = fmt.Fprintf(w, "│    %-20s %5d                       │\n", e.name, e.count)
 	}
 }
 

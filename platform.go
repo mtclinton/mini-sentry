@@ -133,7 +133,7 @@ func (p *PtracePlatform) Run(spec *ExecSpec) (int, error) {
 	if err := spec.applyRlimits(child); err != nil {
 		_ = syscall.Kill(child, syscall.SIGKILL)
 		var ws syscall.WaitStatus
-		syscall.Wait4(child, &ws, 0, nil)
+		_, _ = syscall.Wait4(child, &ws, 0, nil)
 		return -1, fmt.Errorf("apply rlimits: %w", err)
 	}
 
@@ -260,7 +260,7 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			}
 			act := p.sentry.signals.GetAction(int(sig))
 			forward := true
-			reason := "default"
+			var reason string
 			switch act.handler {
 			case sigIGN:
 				forward = false
@@ -277,7 +277,7 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			if forward {
 				p.sentry.signals.countDelivered(int(sig))
 			}
-			fmt.Fprintf(logWriter(),
+			_, _ = fmt.Fprintf(logWriter(),
 				"  [platform] signal-stop %s (%d) → %s (%s)\n",
 				signalName(int(sig)), int(sig),
 				func() string {
@@ -296,7 +296,7 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			}
 			// Skip the SYSEMU at top of loop since we just resumed
 			var ws2 syscall.WaitStatus
-			syscall.Wait4(pid, &ws2, 0, nil)
+			_, _ = syscall.Wait4(pid, &ws2, 0, nil)
 			if ws2.Exited() {
 				return ws2.ExitStatus(), nil
 			}

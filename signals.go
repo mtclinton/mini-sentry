@@ -59,6 +59,7 @@ func (s sigset) has(signum int) bool {
 	return s&(1<<uint(signum-1)) != 0
 }
 
+//nolint:unused // exercised by signals_test.go in a follow-up commit.
 func (s sigset) add(signum int) sigset {
 	if signum < 1 || signum >= nSig {
 		return s
@@ -66,6 +67,7 @@ func (s sigset) add(signum int) sigset {
 	return s | (1 << uint(signum-1))
 }
 
+//nolint:unused // exercised by signals_test.go in a follow-up commit.
 func (s sigset) del(signum int) sigset {
 	if signum < 1 || signum >= nSig {
 		return s

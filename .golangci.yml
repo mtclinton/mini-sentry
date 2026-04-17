@@ -1,0 +1,21 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - gocritic
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unparam
+    - unused
+  # Explicitly disabled (recorded so the "why" survives):
+  #   gosec   — too noisy against raw-syscall and ptrace code.
+  #   gocyclo — the syscall dispatcher is naturally long; splitting it
+  #             hurts readability more than cyclomatic complexity helps.
+  #   lll     — 80-col limits aren't useful in Go with descriptive names.

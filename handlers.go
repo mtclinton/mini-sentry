@@ -290,7 +290,7 @@ func (s *Sentry) sysOpenat(pid int, sc SyscallArgs) uint64 {
 	// reads it — doable but carries TOCTTOU risk; deferred.
 	cleanPath := filepath.Clean(path)
 	if hostPath, _, ok := matchMount(s.mounts, cleanPath); ok && hostPath == cleanPath {
-		fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → passthrough (mount %s)\n", path, hostPath)
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → passthrough (mount %s)\n", path, hostPath)
 		s.requestPassthrough(nil)
 		return 0
 	}
@@ -301,14 +301,14 @@ func (s *Sentry) sysOpenat(pid int, sc SyscallArgs) uint64 {
 		fd := s.nextFD
 		s.nextFD++
 		s.fdTable[fd] = &OpenFile{path: path, data: data}
-		fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → fd %d (%d bytes)\n", path, fd, len(data))
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → fd %d (%d bytes)\n", path, fd, len(data))
 		return uint64(fd)
 	}
 
 	// EACCES / any non-ENOENT error is propagated as-is. ENOENT may
 	// still turn into a successful directory open below.
 	if eno != syscall.ENOENT {
-		fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → %v\n", path, eno)
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → %v\n", path, eno)
 		return errno(eno)
 	}
 
@@ -320,11 +320,11 @@ func (s *Sentry) sysOpenat(pid int, sc SyscallArgs) uint64 {
 		fd := s.nextFD
 		s.nextFD++
 		s.fdTable[fd] = &OpenFile{path: path, isDir: true}
-		fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → fd %d (dir, %d entries)\n", path, fd, len(entries))
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → fd %d (dir, %d entries)\n", path, fd, len(entries))
 		return uint64(fd)
 	}
 
-	fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → ENOENT (not in sandbox)\n", path)
+	_, _ = fmt.Fprintf(logWriter(), "  [sentry] openat(%q) → ENOENT (not in sandbox)\n", path)
 	return errno(syscall.ENOENT)
 }
 
@@ -359,7 +359,7 @@ func (s *Sentry) sysClose(sc SyscallArgs) uint64 {
 	}
 	// Socket: close the real outbound connection.
 	if f.isSocket && f.conn != nil {
-		f.conn.Close()
+		_ = f.conn.Close()
 	}
 	delete(s.fdTable, fd)
 	return 0
@@ -625,6 +625,10 @@ func packDirent64(ino uint64, name string, dtype byte) []byte {
 // We just move a pointer — the actual memory is the child's own.
 // ──────────────────────────────────────────────────────────────────────
 
+//nolint:unused // educational placeholder — SYSEMU can't emulate brk
+// from userspace (it modifies kernel-managed page tables). Documented
+// in the README's syscall table; preserved for parity with gVisor's
+// handler model.
 func (s *Sentry) sysBrk(sc SyscallArgs) uint64 {
 	addr := sc.Args[0]
 	if addr == 0 {
@@ -648,6 +652,7 @@ func (s *Sentry) sysBrk(sc SyscallArgs) uint64 {
 // works for the common case of anonymous heap/stack allocations.
 // ──────────────────────────────────────────────────────────────────────
 
+//nolint:unused // educational placeholder — same reasoning as sysBrk.
 func (s *Sentry) sysMmap(sc SyscallArgs) uint64 {
 	addr := sc.Args[0]
 	length := sc.Args[1]
@@ -684,6 +689,9 @@ func (s *Sentry) sysMmap(sc SyscallArgs) uint64 {
 // On arm64, TLS is set via the TPIDR_EL0 register (no arch_prctl needed).
 // ──────────────────────────────────────────────────────────────────────
 
+//nolint:unused,unparam // educational placeholder — TLS setup lives
+// in the kernel via SYSEMU passthrough, not in a userspace handler.
+// pid is kept in the signature to match the platform's handler shape.
 func (s *Sentry) sysArchPrctl(pid int, sc SyscallArgs) uint64 {
 	code := int(sc.Args[0])
 
@@ -767,7 +775,7 @@ func (s *Sentry) sysWritev(pid int, sc SyscallArgs) uint64 {
 	if !ok {
 		return errno(syscall.EBADF)
 	}
-	if !(f.isHost && f.writable) {
+	if !f.isHost || !f.writable {
 		return errno(syscall.EBADF)
 	}
 	if iovcnt <= 0 || iovcnt > 1024 {
@@ -1169,6 +1177,8 @@ func writeToChild(pid int, addr uint64, data []byte) {
 	}
 }
 
+//nolint:unparam // maxLen is callsite-tunable for future callers that
+// need shorter caps (e.g. bounded path reads on recvfrom).
 func readStringFromChild(pid int, addr uint64, maxLen int) string {
 	buf := readFromChild(pid, addr, uint64(maxLen))
 	for i, b := range buf {
@@ -1248,7 +1258,7 @@ func (s *Sentry) sysRtSigaction(pid int, sc SyscallArgs) uint64 {
 				newAct.restorer = binary.LittleEndian.Uint64(buf[layout.restorerOff : layout.restorerOff+8])
 			}
 			s.signals.SetAction(signum, newAct)
-			fmt.Fprintf(logWriter(), "  [sentry] rt_sigaction: %s -> %s\n",
+			_, _ = fmt.Fprintf(logWriter(), "  [sentry] rt_sigaction: %s -> %s\n",
 				signalName(signum), newAct.String())
 		}
 	}
@@ -1304,7 +1314,7 @@ func (s *Sentry) sysRtSigprocmask(pid int, sc SyscallArgs) uint64 {
 	} else {
 		oldMask = s.signals.GetMask()
 	}
-	fmt.Fprintf(logWriter(), "  [sentry] rt_sigprocmask: how=%d set=0x%x -> mask=0x%x\n",
+	_, _ = fmt.Fprintf(logWriter(), "  [sentry] rt_sigprocmask: how=%d set=0x%x -> mask=0x%x\n",
 		how, uint64(newSet), uint64(s.signals.GetMask()))
 
 	if oldsetPtr != 0 {
@@ -1385,14 +1395,14 @@ func (s *Sentry) sendSelfSignal(pid, signum int, from string) uint64 {
 	}
 	s.signals.CountGenerated(signum)
 	if err := syscall.Kill(pid, syscall.Signal(signum)); err != nil {
-		fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d, %d): %v\n",
+		_, _ = fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d, %d): %v\n",
 			from, signalName(signum), pid, signum, err)
 		if e, ok := err.(syscall.Errno); ok {
 			return errno(e)
 		}
 		return errno(syscall.EPERM)
 	}
-	fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d) queued\n",
+	_, _ = fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> kill(%d) queued\n",
 		from, signalName(signum), pid)
 	return 0
 }

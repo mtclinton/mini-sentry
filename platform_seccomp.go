@@ -190,15 +190,17 @@ func (p *SeccompPlatform) Run(spec *ExecSpec) (int, error) {
 
 	selfExe, err := os.Executable()
 	if err != nil {
-		syscall.Close(parentSock)
-		syscall.Close(childSock)
+		_ = syscall.Close(parentSock)
+		_ = syscall.Close(childSock)
 		return -1, fmt.Errorf("os.Executable: %w", err)
 	}
 
 	// Strip our own bootstrap vars from the spec's base env so the
 	// bootstrap's re-entry test works cleanly, then append them back.
 	base := stripEnv(spec.BuildEnv(os.Environ()), bootstrapEnvVar, emulatedEnvVar)
-	env := append(base,
+	env := make([]string, 0, len(base)+2)
+	env = append(env, base...)
+	env = append(env,
 		bootstrapEnvVar+"=1",
 		emulatedEnvVar+"="+strings.Join(emStrs, ","),
 	)
@@ -214,9 +216,9 @@ func (p *SeccompPlatform) Run(spec *ExecSpec) (int, error) {
 	}
 	applyCredToSysProcAttr(procAttr.Sys, spec)
 	child, err := syscall.ForkExec(selfExe, bootstrapArgv, procAttr)
-	syscall.Close(childSock)
+	_ = syscall.Close(childSock)
 	if err != nil {
-		syscall.Close(parentSock)
+		_ = syscall.Close(parentSock)
 		return -1, fmt.Errorf("fork bootstrap: %w", err)
 	}
 
@@ -226,8 +228,8 @@ func (p *SeccompPlatform) Run(spec *ExecSpec) (int, error) {
 	if err := spec.applyRlimits(child); err != nil {
 		_ = syscall.Kill(child, syscall.SIGKILL)
 		var ws syscall.WaitStatus
-		syscall.Wait4(child, &ws, 0, nil)
-		syscall.Close(parentSock)
+		_, _ = syscall.Wait4(child, &ws, 0, nil)
+		_ = syscall.Close(parentSock)
 		return -1, fmt.Errorf("apply rlimits: %w", err)
 	}
 
@@ -237,7 +239,7 @@ func (p *SeccompPlatform) Run(spec *ExecSpec) (int, error) {
 	buf := make([]byte, 8)
 	oob := make([]byte, syscall.CmsgSpace(4))
 	_, oobn, _, _, err := syscall.Recvmsg(parentSock, buf, oob, 0)
-	syscall.Close(parentSock)
+	_ = syscall.Close(parentSock)
 	if err != nil {
 		return -1, fmt.Errorf("recvmsg listener fd: %w", err)
 	}
@@ -255,7 +257,7 @@ func (p *SeccompPlatform) Run(spec *ExecSpec) (int, error) {
 
 	// Non-blocking so we can interleave Wait4(WNOHANG) with notification drains.
 	if err := unix.SetNonblock(listenerFD, true); err != nil {
-		syscall.Close(listenerFD)
+		_ = syscall.Close(listenerFD)
 		return -1, fmt.Errorf("set nonblock: %w", err)
 	}
 
@@ -271,7 +273,7 @@ func (p *SeccompPlatform) notifLoop(child, listenerFD int) (int, error) {
 	for {
 		_, err := unix.Poll(pollFds, 10)
 		if err != nil && err != syscall.EINTR {
-			syscall.Close(listenerFD)
+			_ = syscall.Close(listenerFD)
 			return -1, fmt.Errorf("poll: %w", err)
 		}
 
@@ -337,11 +339,11 @@ func (p *SeccompPlatform) notifLoop(child, listenerFD int) (int, error) {
 			if werr == syscall.EINTR {
 				continue
 			}
-			syscall.Close(listenerFD)
+			_ = syscall.Close(listenerFD)
 			return -1, fmt.Errorf("wait4: %w", werr)
 		}
 		if wpid == child {
-			syscall.Close(listenerFD)
+			_ = syscall.Close(listenerFD)
 			if ws.Exited() {
 				return ws.ExitStatus(), nil
 			}
@@ -448,17 +450,17 @@ func RunSeccompBootstrap() {
 	if e != 0 {
 		// write/stderr is emulated — can't fmt.Printf. Exit with a
 		// distinctive code so the parent can tell what happened.
-		syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 97, 0, 0)
+		_, _, _ = syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 97, 0, 0)
 	}
 
 	// execve. Filter survives exec, so the target process inherits it.
-	syscall.RawSyscall(syscall.SYS_EXECVE,
+	_, _, _ = syscall.RawSyscall(syscall.SYS_EXECVE,
 		uintptr(unsafe.Pointer(argv0p)),
 		uintptr(unsafe.Pointer(&argvp[0])),
 		uintptr(unsafe.Pointer(&envvp[0])))
 
 	// Only reached on execve failure.
-	syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 98, 0, 0)
+	_, _, _ = syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 98, 0, 0)
 }
 
 // buildSeccompFilter emits:

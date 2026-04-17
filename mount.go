@@ -145,6 +145,10 @@ func deserializeMounts(s string) []Mount {
 // matchMount finds the best (longest-prefix) mount for the given guest
 // path. Returns the host path that the guest path maps to and whether
 // the mount was read-only. ok=false means no mount covers the path.
+//
+//nolint:unparam // readOnly return kept for API symmetry; future RO
+// enforcement (e.g. rejecting write syscalls against RO mounts) will
+// consume it without changing this signature.
 func matchMount(mounts []Mount, guestPath string) (hostPath string, readOnly bool, ok bool) {
 	guest := filepath.Clean(guestPath)
 	for _, m := range mounts {

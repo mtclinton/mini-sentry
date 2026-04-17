@@ -55,13 +55,11 @@ func RunGoferBootstrap() {
 		os.Exit(1)
 	}
 	conn, err := net.FileConn(f)
-	f.Close()
+	_ = f.Close() // FileConn dup'd the fd
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[gofer] net.FileConn: %v\n", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
-
 	g := newGoferServer(os.Getenv(goferRootEnvVar))
 	g.denies = parseDenyList(os.Getenv(goferDenyEnvVar))
 	g.mounts = sortMountsByGuestLen(deserializeMounts(os.Getenv(goferMountsEnvVar)))
@@ -73,6 +71,8 @@ func RunGoferBootstrap() {
 	}
 
 	g.Serve(conn)
+	// Close explicitly — os.Exit below bypasses deferred cleanup.
+	_ = conn.Close()
 	os.Exit(0)
 }
 
@@ -444,8 +444,8 @@ func startGofer(goferRoot, goferDeny string, mounts []Mount) (*GoferVFS, func(),
 
 	selfExe, err := os.Executable()
 	if err != nil {
-		syscall.Close(parentFD)
-		syscall.Close(childFD)
+		_ = syscall.Close(parentFD)
+		_ = syscall.Close(childFD)
 		return nil, nil, fmt.Errorf("os.Executable: %w", err)
 	}
 
@@ -474,29 +474,29 @@ func startGofer(goferRoot, goferDeny string, mounts []Mount) (*GoferVFS, func(),
 		Files: []uintptr{0, 1, 2, uintptr(childFD)},
 		Env:   env,
 	})
-	syscall.Close(childFD)
+	_ = syscall.Close(childFD)
 	if err != nil {
-		syscall.Close(parentFD)
+		_ = syscall.Close(parentFD)
 		return nil, nil, fmt.Errorf("fork gofer: %w", err)
 	}
 
 	parentFile := os.NewFile(uintptr(parentFD), "gofer-sock-parent")
 	conn, err := net.FileConn(parentFile)
-	parentFile.Close() // FileConn dup'd the fd
+	_ = parentFile.Close() // FileConn dup'd the fd
 	if err != nil {
-		// best-effort: tear down the child
-		syscall.Kill(pid, syscall.SIGKILL)
+		// Best-effort teardown; the err we're returning is what matters.
+		_ = syscall.Kill(pid, syscall.SIGKILL)
 		var ws syscall.WaitStatus
-		syscall.Wait4(pid, &ws, 0, nil)
+		_, _ = syscall.Wait4(pid, &ws, 0, nil)
 		return nil, nil, fmt.Errorf("net.FileConn: %w", err)
 	}
 
 	client := NewGoferVFS(conn)
 
 	cleanup := func() {
-		conn.Close()
+		_ = conn.Close()
 		var ws syscall.WaitStatus
-		syscall.Wait4(pid, &ws, 0, nil)
+		_, _ = syscall.Wait4(pid, &ws, 0, nil)
 	}
 	return client, cleanup, nil
 }

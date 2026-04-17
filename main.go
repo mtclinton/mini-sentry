@@ -273,27 +273,27 @@ func fatalf(format string, args ...interface{}) {
 }
 
 func printStartBanner(w *os.File, platformLabel, vfsLabel string, fileCount int, spec *ExecSpec) {
-	fmt.Fprintf(w, "\n┌─────────────────────────────────────────────────────┐\n")
-	fmt.Fprintf(w, "│  %s: userspace kernel starting             │\n", padRight(progName, 11))
-	fmt.Fprintf(w, "│  Platform: %s│\n", padRight(platformLabel, 41))
-	fmt.Fprintf(w, "│  VFS:      %s│\n", padRight(vfsLabel, 41))
+	_, _ = fmt.Fprintf(w,"\n┌─────────────────────────────────────────────────────┐\n")
+	_, _ = fmt.Fprintf(w,"│  %s: userspace kernel starting             │\n", padRight(progName, 11))
+	_, _ = fmt.Fprintf(w,"│  Platform: %s│\n", padRight(platformLabel, 41))
+	_, _ = fmt.Fprintf(w,"│  VFS:      %s│\n", padRight(vfsLabel, 41))
 	cmd := spec.Program + " " + strings.Join(spec.Args, " ")
-	fmt.Fprintf(w, "│  Sandboxing: %s│\n", padRight(strings.TrimSpace(cmd), 38))
-	fmt.Fprintf(w, "├─────────────────────────────────────────────────────┤\n")
-	fmt.Fprintf(w, "│  Architecture (maps to gVisor):                      │\n")
-	fmt.Fprintf(w, "│    Platform  → %s│\n", padRight(platformLabel, 37))
-	fmt.Fprintf(w, "│    Sentry    → Go handlers (emulate kernel)          │\n")
+	_, _ = fmt.Fprintf(w,"│  Sandboxing: %s│\n", padRight(strings.TrimSpace(cmd), 38))
+	_, _ = fmt.Fprintf(w,"├─────────────────────────────────────────────────────┤\n")
+	_, _ = fmt.Fprintf(w,"│  Architecture (maps to gVisor):                      │\n")
+	_, _ = fmt.Fprintf(w,"│    Platform  → %s│\n", padRight(platformLabel, 37))
+	_, _ = fmt.Fprintf(w,"│    Sentry    → Go handlers (emulate kernel)          │\n")
 	gvLine := fmt.Sprintf("%s (%d files)", vfsLabel, fileCount)
-	fmt.Fprintf(w, "│    Gofer/VFS → %s│\n", padRight(gvLine, 37))
-	fmt.Fprintf(w, "└─────────────────────────────────────────────────────┘\n\n")
+	_, _ = fmt.Fprintf(w,"│    Gofer/VFS → %s│\n", padRight(gvLine, 37))
+	_, _ = fmt.Fprintf(w,"└─────────────────────────────────────────────────────┘\n\n")
 }
 
 func printExitBanner(w *os.File, exitCode int, sentry *Sentry) {
-	fmt.Fprintf(w, "\n┌─────────────────────────────────────────────────────┐\n")
-	fmt.Fprintf(w, "│  Sandbox exited (code %d)                             │\n", exitCode)
-	fmt.Fprintf(w, "├─────────────────────────────────────────────────────┤\n")
+	_, _ = fmt.Fprintf(w,"\n┌─────────────────────────────────────────────────────┐\n")
+	_, _ = fmt.Fprintf(w,"│  Sandbox exited (code %d)                             │\n", exitCode)
+	_, _ = fmt.Fprintf(w,"├─────────────────────────────────────────────────────┤\n")
 	sentry.PrintStats(w)
-	fmt.Fprintf(w, "└─────────────────────────────────────────────────────┘\n")
+	_, _ = fmt.Fprintf(w,"└─────────────────────────────────────────────────────┘\n")
 }
 
 func padRight(s string, n int) string {
