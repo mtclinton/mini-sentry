@@ -1,4 +1,4 @@
-.PHONY: build guest run clean verbose bench samples test test-quick lint check mini-sentry
+.PHONY: build guest run clean verbose bench samples test test-quick lint check mini-sentry regen-oracle
 
 # Detect the host OS. On Linux, build natively. On macOS, cross-compile.
 UNAME_OS := $(shell uname -s)
@@ -92,3 +92,18 @@ samples/%: samples/%.c
 
 clean:
 	rm -f sentry-exec mini-sentry cmd/guest/guest samples/echo samples/cat samples/ls samples/pwd samples/edges samples/stress samples/sysfuzz samples/httpget
+
+# Rebuild the capture harness and regenerate the committed rt_sigframe
+# oracle.  The oracle is a byte-exact kernel-captured signal frame that
+# frame_test.go :: TestBuildRtSigframeMatchesKernel diffs our builder
+# output against.  It's host-ABI sensitive, so only regenerate when you
+# understand what changed (kernel/glibc upgrade, host XCR0 change, etc.)
+# — see testdata/README.md.  This target is deliberately NOT a
+# dependency of `make test` or `make check`.
+testdata/sigframe_capture/sigframe_capture: testdata/sigframe_capture/main.c
+	$(MAKE) -C testdata/sigframe_capture
+
+regen-oracle: testdata/sigframe_capture/sigframe_capture
+	./testdata/sigframe_capture/sigframe_capture 2>testdata/sigframe_amd64_sigusr1.hex
+	@echo "Regenerated testdata/sigframe_amd64_sigusr1.hex"
+	@echo "Update testdata/README.md captured-on block if host changed."
