@@ -273,14 +273,18 @@ static unsigned char frame_copy[1024];
 static size_t frame_size;
 
 static void handler(int signo, siginfo_t *si, void *uc) {
-    // The kernel lays the frame out (high → low): ucontext,
-    // siginfo, 8-byte return-address slot holding the restorer
-    // pointer. RSP on handler entry points at that return-address
-    // slot — `si` is 8 bytes *above* it. Back up 8 so the capture
-    // includes the restorer slot; it's part of the frame and part
-    // of what our builder has to emit.
-    unsigned char *frame_bottom = (unsigned char *)si - 8;
-    frame_size = 1024 + 8;
+    // The kernel lays the frame out (low → high): pretcode
+    // (the 8-byte return-address slot holding the restorer
+    // pointer), then ucontext, then siginfo, then fpstate after
+    // 16 bytes of padding. RSP on handler entry points at the
+    // pretcode slot; `uc` is 8 bytes *above* it. Back up 8 so
+    // the capture includes the pretcode slot — it's part of the
+    // frame and part of what our builder has to emit. Note: the
+    // earlier draft of this ADR anchored on `si - 8`; that was
+    // wrong (pretcode lives 312 bytes below siginfo, not 8), and
+    // the first capture only caught the tail of uc.sigmask.
+    unsigned char *frame_bottom = (unsigned char *)uc - 8;
+    frame_size = 1032;
     memcpy(frame_copy, frame_bottom, frame_size);
 }
 

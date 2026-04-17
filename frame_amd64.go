@@ -26,6 +26,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"syscall"
 )
 
@@ -190,6 +191,28 @@ func BuildRtSigframe(
 	return buf, newRsp
 }
 
+// DecodeRtSigframe is the inverse of BuildRtSigframe: it parses the
+// 1032-byte on-stack frame the kernel wrote (or the handler mutated)
+// back into register, fp, and mask state that rt_sigreturn will
+// restore.  The returned fpstatePtr is the absolute guest address the
+// frame's mcontext claims fpstate lives at — callers validate this
+// equals rsp + FrameOffFpstate to catch a malicious handler pointing
+// fpstate at kernel or Sentry memory.  We do not dereference it.
+func DecodeRtSigframe(frame []byte) (
+	regs syscall.PtraceRegs, fpregs FxRegs, mask sigset,
+	fpstatePtr uint64, err error,
+) {
+	if len(frame) != RtSigframeSize {
+		err = fmt.Errorf("rt_sigframe length = %d, want %d", len(frame), RtSigframeSize)
+		return
+	}
+	le := binary.LittleEndian
+	fpstatePtr = readMContext(frame[FrameOffUcontext+UcOffMContext:], &regs)
+	mask = sigset(le.Uint64(frame[FrameOffUcontext+UcOffSigmask:]))
+	copy(fpregs[:], frame[FrameOffFpstate:FrameOffFpstate+fxregsSize])
+	return
+}
+
 // writeMContext serializes a syscall.PtraceRegs into the 256-byte
 // mcontext slot at mc.  fpstateAddr is the absolute guest-memory
 // address rt_sigreturn will dereference to find fpstate.
@@ -217,4 +240,34 @@ func writeMContext(mc []byte, regs *syscall.PtraceRegs, fpstateAddr uint64) {
 	le.PutUint16(mc[McOffCs+6:], kernelSs) // gs,fs stay 0; ss at Cs+6
 	le.PutUint64(mc[McOffFpstate:], fpstateAddr)
 	// err/trapno/oldmask/cr2 and reserved[8] stay 0.
+}
+
+// readMContext is the inverse of writeMContext: it deserializes the
+// 256-byte mcontext slot at mc into regs and returns the absolute
+// fpstate address the frame pointed at.  cs/gs/fs/ss selectors and
+// the err/trapno/oldmask/cr2 tail are ignored — restoring them isn't
+// PTRACE_SETREGS's job (segment regs need ARCH_SET_{FS,GS}; trap-info
+// is kernel-only) and a malicious handler can't weaponize leaving
+// them at their pre-signal values.
+func readMContext(mc []byte, regs *syscall.PtraceRegs) uint64 {
+	le := binary.LittleEndian
+	regs.R8 = le.Uint64(mc[0:])
+	regs.R9 = le.Uint64(mc[8:])
+	regs.R10 = le.Uint64(mc[16:])
+	regs.R11 = le.Uint64(mc[24:])
+	regs.R12 = le.Uint64(mc[32:])
+	regs.R13 = le.Uint64(mc[40:])
+	regs.R14 = le.Uint64(mc[48:])
+	regs.R15 = le.Uint64(mc[56:])
+	regs.Rdi = le.Uint64(mc[McOffRdi+0:])
+	regs.Rsi = le.Uint64(mc[McOffRdi+8:])
+	regs.Rbp = le.Uint64(mc[McOffRdi+16:])
+	regs.Rbx = le.Uint64(mc[McOffRdi+24:])
+	regs.Rdx = le.Uint64(mc[McOffRdi+32:])
+	regs.Rax = le.Uint64(mc[McOffRdi+40:])
+	regs.Rcx = le.Uint64(mc[McOffRdi+48:])
+	regs.Rsp = le.Uint64(mc[McOffRsp:])
+	regs.Rip = le.Uint64(mc[McOffRip:])
+	regs.Eflags = le.Uint64(mc[McOffEflags:])
+	return le.Uint64(mc[McOffFpstate:])
 }

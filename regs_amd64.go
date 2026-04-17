@@ -12,7 +12,11 @@ package main
 // Note: R10 (not RCX) for arg4 — the kernel clobbers RCX with the return
 // address, so the libc syscall wrapper moves arg4 from RCX to R10.
 
-import "golang.org/x/sys/unix"
+import (
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
 
 // regsToSyscall extracts the syscall number and arguments from x86_64 registers.
 func regsToSyscall(regs *unix.PtraceRegs) SyscallArgs {
@@ -56,6 +60,31 @@ func rewindSyscallInstruction(regs *unix.PtraceRegs) {
 // syscall we need RAX to carry the original number again.
 func restoreSyscallNumber(regs *unix.PtraceRegs) {
 	regs.Rax = regs.Orig_rax
+}
+
+// ptraceRegsFromSyscall copies the fields of a syscall.PtraceRegs
+// into a unix.PtraceRegs.  The two types mirror the kernel's
+// user_regs_struct and have identical layout on linux/amd64, but
+// Go doesn't allow conversion between distinct named structs.  The
+// signal-frame builder/decoder use syscall.PtraceRegs (stdlib-only,
+// matches its test imports); the platform wrapper uses unix.PtraceRegs.
+func ptraceRegsFromSyscall(in *syscall.PtraceRegs) unix.PtraceRegs {
+	return unix.PtraceRegs{
+		R15: in.R15, R14: in.R14, R13: in.R13, R12: in.R12,
+		Rbp: in.Rbp, Rbx: in.Rbx,
+		R11: in.R11, R10: in.R10, R9: in.R9, R8: in.R8,
+		Rax: in.Rax, Rcx: in.Rcx, Rdx: in.Rdx,
+		Rsi: in.Rsi, Rdi: in.Rdi,
+		Orig_rax: in.Orig_rax,
+		Rip:      in.Rip,
+		Cs:       in.Cs,
+		Eflags:   in.Eflags,
+		Rsp:      in.Rsp,
+		Ss:       in.Ss,
+		Fs_base:  in.Fs_base,
+		Gs_base:  in.Gs_base,
+		Ds:       in.Ds, Es: in.Es, Fs: in.Fs, Gs: in.Gs,
+	}
 }
 
 // kernelSigactionSize is the wire size of struct kernel_sigaction as

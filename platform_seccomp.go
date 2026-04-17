@@ -302,7 +302,8 @@ func (p *SeccompPlatform) notifLoop(child, listenerFD int) (int, error) {
 			ret, action := p.sentry.HandleSyscall(int(notif.PID), sc)
 
 			resp := seccompNotifResp{ID: notif.ID}
-			if action == ActionPassthrough {
+			switch action {
+			case ActionPassthrough, ActionKeepRegs:
 				// Tell the kernel to just run the syscall. We can't
 				// observe the return value — unlike the ptrace platform
 				// there's no post-stop — so any post-passthrough
@@ -310,8 +311,15 @@ func (p *SeccompPlatform) notifLoop(child, listenerFD int) (int, error) {
 				// the floor. That's fine for Phase 2: subsequent fd
 				// operations hit shouldPassthroughFD(unknown)=true and
 				// the kernel handles them directly.
+				//
+				// KeepRegs degrades to "let the kernel run it": the
+				// handler can't PTRACE_SETREGS under seccomp (no
+				// ptrace relationship), so on this platform the
+				// handler is expected to early-return via passthrough.
+				// Treat KeepRegs the same way defensively in case it
+				// slips through.
 				resp.Flags = seccompUserNotifFlagContinue
-			} else {
+			default:
 				signed := int64(ret)
 				// Negative errnos live in the small negative range; map them to
 				// resp.Error. Everything else (counts, fds, addresses) goes in val.

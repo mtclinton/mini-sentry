@@ -53,11 +53,19 @@ type SyscallArgs struct {
 // break (brk), signal masks, etc. The Platform rewinds RIP back to the
 // `syscall` instruction and re-runs it under PTRACE_SYSCALL mode so the
 // kernel actually executes it.
+//
+// ActionKeepRegs is the "the handler already wrote every register it
+// cares about via PTRACE_SETREGS; please don't clobber them by stuffing
+// a return value into rax" case. sysRtSigreturn uses this: restoring a
+// signal frame means replacing the entire user register file (rip, rsp,
+// rax, flags, all of it), so the platform must leave what the handler
+// set in place instead of overwriting rax with ret.
 type SyscallAction int
 
 const (
 	ActionReturn      SyscallAction = iota // inject the returned value
 	ActionPassthrough                      // execute in the real kernel
+	ActionKeepRegs                         // handler already set regs; leave them alone
 )
 
 // SyscallHandler implements one syscall. Returns the value the sandboxed
@@ -127,6 +135,13 @@ type Sentry struct {
 	// passthrough openat gets to register the fd the kernel allocated.
 	pendingPassthrough     bool
 	pendingPostPassthrough func(retval uint64)
+
+	// pendingKeepRegs is set by a syscall handler that has already
+	// rewritten the tracee's register file via PTRACE_SETREGS and does
+	// not want the platform to overwrite rax with the returned value.
+	// The one caller today is sysRtSigreturn — restoring a signal frame
+	// means replacing rip, rsp, rax, flags, the whole thing.
+	pendingKeepRegs bool
 
 	// signals is the Sentry's mirror of the tracee's signal disposition
 	// table and mask. Phase 3a records state here but still passthroughs
@@ -312,6 +327,10 @@ func (s *Sentry) buildSyscallTable() {
 	emulated(unix.SYS_KILL, "kill", (*Sentry).sysKill)
 	emulated(unix.SYS_TKILL, "tkill", (*Sentry).sysTkill)
 	emulated(unix.SYS_TGKILL, "tgkill", (*Sentry).sysTgkill)
+	// rt_sigreturn is arch-specific. amd64 overrides this entry in
+	// addArchSyscalls with an emulated handler (sysRtSigreturn) that
+	// decodes the rt_sigframe and restores the user register file.
+	// arm64 keeps the passthrough until its own decoder lands.
 	passthrough(unix.SYS_RT_SIGRETURN, "rt_sigreturn")
 	passthrough(unix.SYS_SIGALTSTACK, "sigaltstack")
 	passthrough(unix.SYS_FUTEX, "futex")
@@ -344,6 +363,15 @@ func (s *Sentry) SetMounts(mounts []Mount) {
 func (s *Sentry) requestPassthrough(cb func(retval uint64)) {
 	s.pendingPassthrough = true
 	s.pendingPostPassthrough = cb
+}
+
+// requestKeepRegs asks the Platform to skip its trailing SETREGS step
+// for this syscall. The handler has already written the full register
+// file it wants; overwriting rax now would undo the restore.
+//
+// Called from within a handler (which runs under s.mu), so no locking.
+func (s *Sentry) requestKeepRegs() {
+	s.pendingKeepRegs = true
 }
 
 // PostPassthrough is the Platform's callback after a passthrough syscall
@@ -383,6 +411,7 @@ func (s *Sentry) HandleSyscall(pid int, sc SyscallArgs) (uint64, SyscallAction) 
 	// on the next syscall.
 	s.pendingPassthrough = false
 	s.pendingPostPassthrough = nil
+	s.pendingKeepRegs = false
 
 	entry, ok := s.syscalls[sc.Number]
 	if !ok {
@@ -402,6 +431,9 @@ func (s *Sentry) HandleSyscall(pid int, sc SyscallArgs) (uint64, SyscallAction) 
 	ret := entry.handler(s, pid, sc)
 	if s.pendingPassthrough {
 		return 0, ActionPassthrough
+	}
+	if s.pendingKeepRegs {
+		return 0, ActionKeepRegs
 	}
 	return ret, ActionReturn
 }

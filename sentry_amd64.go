@@ -71,4 +71,14 @@ func (s *Sentry) addArchSyscalls() {
 		name:        "arch_prctl",
 		passthrough: true,
 	}
+	// rt_sigreturn is emulated on amd64 as of Phase 3b commit 2: our
+	// handler decodes the rt_sigframe the (Sentry-delivered, commit 3)
+	// signal flow left on the user stack and restores the tracee's
+	// register and fp state.  buildSyscallTable registered a passthrough
+	// entry to keep arm64 and pre-3b behavior working; we override it
+	// here.
+	s.syscalls[unix.SYS_RT_SIGRETURN] = SyscallEntry{
+		name:    "rt_sigreturn",
+		handler: (*Sentry).sysRtSigreturn,
+	}
 }

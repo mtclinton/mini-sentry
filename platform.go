@@ -362,6 +362,13 @@ func (p *PtracePlatform) handleSyscallStop(pid int) error {
 		return nil
 	}
 
+	if action == ActionKeepRegs {
+		// Handler already wrote the register file via PTRACE_SETREGS
+		// (rt_sigreturn restoring a signal frame). Overwriting rax now
+		// would undo the restore — just resume the tracee.
+		return nil
+	}
+
 	// Write the return value back into the child's registers.
 	setSyscallReturn(&regs, ret)
 	err = unix.PtraceSetRegs(pid, &regs)
