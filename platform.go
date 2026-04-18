@@ -155,12 +155,23 @@ func (p *PtracePlatform) Run(spec *ExecSpec) (int, error) {
 	//                   so we can distinguish syscall-stops from signal-stops.
 	//   TRACEEXEC   — get notified on exec() calls.
 	//   TRACEEXIT   — get notified before the child exits.
+	//   TRACECLONE  — get notified on clone(2). The new thread inherits
+	//                  these options and is auto-stopped with SIGSTOP on
+	//                  its first instruction so the tracer can set up
+	//                  per-thread bookkeeping. ADR 002 §2.
 	err = syscall.PtraceSetOptions(child, syscall.PTRACE_O_TRACESYSGOOD|
 		syscall.PTRACE_O_TRACEEXEC|
-		syscall.PTRACE_O_TRACEEXIT)
+		syscall.PTRACE_O_TRACEEXIT|
+		syscall.PTRACE_O_TRACECLONE)
 	if err != nil {
 		return -1, fmt.Errorf("ptrace set options failed: %w", err)
 	}
+
+	// Stamp the main thread's tid now that we know it. NewSignalState
+	// creates the implicit main ThreadState with tid=0; from this
+	// point on FindThread(child) resolves to that state so mask /
+	// altstack / pending-queue lookups key correctly.
+	p.sentry.signals.SetMainTid(child)
 
 	fmt.Fprintf(os.Stderr, "  [platform] ptrace configured, entering syscall interception loop\n\n")
 
@@ -172,16 +183,25 @@ func (p *PtracePlatform) Run(spec *ExecSpec) (int, error) {
 // interceptLoop is the core ptrace loop that intercepts every syscall.
 //
 // For each iteration:
-//   1. PTRACE_SYSEMU — resume child until next syscall entry
-//   2. waitpid       — block until child stops
+//   1. PTRACE_SYSEMU — resume the thread we last stopped
+//   2. Wait4(-1, WALL) — block until ANY traced thread stops
 //   3. GETREGS       — read syscall number and arguments from registers
 //   4. Sentry.Handle — handle the syscall in userspace
 //   5. SETREGS       — write return value into RAX
 //   6. goto 1
 //
-// This is the exact same loop gVisor's ptrace platform runs, minus
-// signal forwarding and multi-thread support.
-func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
+// ADR 002 §4 rewrote this loop to be multi-thread aware: we no longer
+// hardcode `mainPid` into wait4, and we resume whichever tid last
+// stopped. `mainPid` survives only as the identity of the initial
+// tracee — its exit terminates the sandbox; worker-thread exits
+// unregister a ThreadState and keep the loop running.
+func (p *PtracePlatform) interceptLoop(mainPid int) (int, error) {
+	// activeTid is the thread we most recently stopped. It starts as
+	// the main tracee (post-exec stop) and updates each iteration to
+	// whichever tid Wait4 returned. PTRACE_SYSEMU always resumes a
+	// specific tid, so we have to remember which one.
+	activeTid := mainPid
+
 	for {
 		// Drain Sentry-queued signals before resuming. Phase 3b
 		// commit 3 (ADR 001 §3) makes the Sentry authoritative for
@@ -189,7 +209,11 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 		// below enqueue onto SignalState.pending, and this drain is
 		// where frames actually get built. The drain is cheap when
 		// the queue is empty — one atomic DequeueUnblocked lookup.
-		if res, err := p.deliverPending(pid); err != nil {
+		//
+		// Pre-routing (commit 2): the drain still operates on the
+		// single implicit main ThreadState through the SignalState
+		// shim. Commit 3 converts it to a per-thread walk.
+		if res, err := p.deliverPending(activeTid); err != nil {
 			return -1, fmt.Errorf("signal drain: %w", err)
 		} else if res.terminate != 0 {
 			// SIG_DFL terminate hit the queue. We don't try to
@@ -197,16 +221,16 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			// by ptrace; its next-resume semantics are messy);
 			// SIGKILL is unblockable and produces a deterministic
 			// wait status.
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+			_ = syscall.Kill(activeTid, syscall.SIGKILL)
 			_, _ = fmt.Fprintf(logWriter(),
 				"  [sentry] SIG_DFL terminate %s → SIGKILL\n",
 				signalName(res.terminate))
 		}
 
-		// Resume the child with PTRACE_SYSEMU.
+		// Resume the thread we last stopped with PTRACE_SYSEMU.
 		// SYSEMU = stop at next syscall entry, but DON'T execute it.
 		// The kernel skips the syscall entirely — we are the kernel now.
-		err := ptraceSysemu(pid, 0)
+		err := ptraceSysemu(activeTid, 0)
 		if err != nil {
 			if err == syscall.ESRCH {
 				// Tracee died between iterations (multi-threaded
@@ -218,29 +242,80 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			return -1, fmt.Errorf("PTRACE_SYSEMU failed: %w", err)
 		}
 
-		// Wait for the child to stop.
+		// Wait for ANY traced thread to stop. WALL (__WALL) is
+		// required under PTRACE_O_TRACECLONE so wait4 reports events
+		// from cloned threads, not just ordinary SIGCHLD-delivering
+		// children. The returned wpid identifies which thread the
+		// event belongs to.
 		var ws syscall.WaitStatus
-		_, err = syscall.Wait4(pid, &ws, 0, nil)
+		wpid, err := syscall.Wait4(-1, &ws, unix.WALL, nil)
 		if err != nil {
 			return -1, fmt.Errorf("waitpid failed: %w", err)
 		}
+		activeTid = wpid
 
 		// Check what happened.
 		switch {
 		case ws.Exited():
-			// Child called exit() and the kernel processed it.
-			return ws.ExitStatus(), nil
+			// A thread exited. If it's the main tracee, the sandbox
+			// is done; otherwise unregister and keep looping. Linux
+			// tears down the whole thread group on exit_group, so
+			// worker-thread exits typically shortly precede the main
+			// tracee's own exit.
+			if wpid == mainPid {
+				return ws.ExitStatus(), nil
+			}
+			p.sentry.signals.DetachThread(wpid)
+			// After a worker exit, activeTid points at a dead thread.
+			// Reset it to the main tracee so the next SYSEMU targets
+			// a live tid. A worker exit comes with the main thread
+			// still stopped at some prior point, so SYSEMU(main) is
+			// a valid next move only if main is also stopped. That's
+			// only true at startup or after we explicitly stopped it.
+			// In practice the worker's exit races with main's next
+			// wait4 event; either way the next wait4 will re-pin
+			// activeTid to a stopped thread. Use mainPid as a
+			// placeholder value that's guaranteed to exist.
+			activeTid = mainPid
+			continue
 
 		case ws.Signaled():
-			// Child was killed by a signal.
-			return 128 + int(ws.Signal()), nil
+			// Thread killed by a signal. Same main-vs-worker rule.
+			if wpid == mainPid {
+				return 128 + int(ws.Signal()), nil
+			}
+			p.sentry.signals.DetachThread(wpid)
+			activeTid = mainPid
+			continue
 
 		case ws.Stopped():
 			sig := ws.StopSignal()
 
-			// Check for ptrace events (exec, exit, etc.)
+			// PTRACE_EVENT_CLONE: the stopping thread just called
+			// clone(2). The new child tid is in GETEVENTMSG.
+			// Register it on the thread group so follow-on events
+			// for that tid route to a real ThreadState. The child
+			// is already stopped by the kernel with SIGSTOP as its
+			// first stop; its event will surface on a later wait4.
+			if ws.TrapCause() == syscall.PTRACE_EVENT_CLONE {
+				if newTid, ok := getPtraceEventMsg(wpid); ok {
+					p.sentry.signals.AttachThread(int(newTid))
+				}
+				continue
+			}
+
+			// Check for other ptrace events (exec, exit, etc.)
 			if ws.TrapCause() == syscall.PTRACE_EVENT_EXIT {
-				// Child is about to exit. Continue to let it finish.
+				// Worker threads announce their exit via EVENT_EXIT
+				// before the actual WIFEXITED status comes through.
+				// Unregister now so routing can't pick the dying
+				// tid; the actual exit reap happens on the next
+				// wait4 iteration and hits the Exited() branch
+				// above (where main-vs-worker decides whether we
+				// return or keep looping).
+				if wpid != mainPid {
+					p.sentry.signals.DetachThread(wpid)
+				}
 				continue
 			}
 			if ws.TrapCause() == syscall.PTRACE_EVENT_EXEC {
@@ -251,10 +326,15 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 
 			// Syscall-stop: signal is SIGTRAP | 0x80 (because TRACESYSGOOD).
 			if sig == syscall.SIGTRAP|0x80 {
-				err = p.handleSyscallStop(pid)
+				err = p.handleSyscallStop(wpid, mainPid)
 				if err != nil {
 					if exited, ok := err.(errExitedDuringPassthrough); ok {
-						return exited.code, nil
+						if wpid == mainPid {
+							return exited.code, nil
+						}
+						p.sentry.signals.DetachThread(wpid)
+						activeTid = mainPid
+						continue
 					}
 					return -1, err
 				}
@@ -270,7 +350,17 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			if sig == syscall.SIGTRAP {
 				continue // ptrace-related, don't forward
 			}
-			if code, terminated, err := p.handleSignalStop(pid, sig); err != nil {
+			// SIGSTOP on a newly-attached thread is ptrace's way of
+			// saying "your new child has arrived, stopped and ready
+			// to be stepped." Swallow it: we resume the thread on
+			// the next SYSEMU. AttachThread is idempotent so we can
+			// safely call it here even if EVENT_CLONE already
+			// registered the tid.
+			if sig == syscall.SIGSTOP && wpid != mainPid {
+				p.sentry.signals.AttachThread(wpid)
+				continue
+			}
+			if code, terminated, err := p.handleSignalStop(wpid, sig); err != nil {
 				return -1, err
 			} else if terminated {
 				return code, nil
@@ -280,6 +370,24 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 			return -1, fmt.Errorf("unexpected wait status: %v", ws)
 		}
 	}
+}
+
+// getPtraceEventMsg wraps PTRACE_GETEVENTMSG (op 0x4201). For
+// PTRACE_EVENT_CLONE the returned value is the new thread's tid.
+// Go's syscall package doesn't expose the call, so we issue it
+// directly. Returns (msg, ok); ok=false on a ptrace error (tracee
+// dying, bad op) so callers can just drop the event.
+func getPtraceEventMsg(pid int) (uint64, bool) {
+	const PTRACE_GETEVENTMSG = 0x4201
+	var msg uint64
+	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE,
+		uintptr(PTRACE_GETEVENTMSG),
+		uintptr(pid), 0,
+		uintptr(unsafe.Pointer(&msg)), 0, 0)
+	if errno != 0 {
+		return 0, false
+	}
+	return msg, true
 }
 
 // handleSyscallStop reads the registers, lets the Sentry handle the syscall,
@@ -298,10 +406,10 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 // We read the registers, dispatch to the Sentry, and write RAX/X0 back.
 // PTRACE_SYSEMU already skipped the real syscall, so whatever we put in
 // RAX/X0 is what the child sees as the syscall result.
-func (p *PtracePlatform) handleSyscallStop(pid int) error {
-	// Read the child's registers.
+func (p *PtracePlatform) handleSyscallStop(tid, tgid int) error {
+	// Read the stopping thread's registers.
 	var regs unix.PtraceRegs
-	err := unix.PtraceGetRegs(pid, &regs)
+	err := unix.PtraceGetRegs(tid, &regs)
 	if err != nil {
 		return fmt.Errorf("PTRACE_GETREGS failed: %w", err)
 	}
@@ -313,14 +421,15 @@ func (p *PtracePlatform) handleSyscallStop(pid int) error {
 	// This is the key abstraction: the Platform doesn't know what the
 	// syscalls mean. It just reads numbers and passes them to the Sentry.
 	// The Sentry is the kernel — it decides what to do.
-	// Pre-multi-thread: tgid == tid == pid. Commit 2 of ADR 002
-	// splits these when per-thread state lands.
-	ret, action := p.sentry.HandleSyscall(pid, pid, sc)
+	// Under multi-thread (ADR 002): tgid is the main tracee pid, tid is
+	// the specific thread that stopped. For single-thread guests they're
+	// equal.
+	ret, action := p.sentry.HandleSyscall(tgid, tid, sc)
 
 	if action == ActionPassthrough {
 		// The Sentry wants the real kernel to run this syscall.
 		// See passthroughSyscall for the mechanics.
-		if err := p.passthroughSyscall(pid, &regs); err != nil {
+		if err := p.passthroughSyscall(tid, &regs); err != nil {
 			return err
 		}
 		// Read the kernel's actual return value out of RAX/X0 and hand
@@ -330,8 +439,8 @@ func (p *PtracePlatform) handleSyscallStop(pid int) error {
 		// the child is likely dying anyway and the main loop's next wait
 		// will surface it.
 		var postRegs unix.PtraceRegs
-		if err := unix.PtraceGetRegs(pid, &postRegs); err == nil {
-			p.sentry.PostPassthrough(pid, getSyscallReturn(&postRegs))
+		if err := unix.PtraceGetRegs(tid, &postRegs); err == nil {
+			p.sentry.PostPassthrough(tid, getSyscallReturn(&postRegs))
 		}
 		return nil
 	}
@@ -345,7 +454,7 @@ func (p *PtracePlatform) handleSyscallStop(pid int) error {
 
 	// Write the return value back into the child's registers.
 	setSyscallReturn(&regs, ret)
-	err = unix.PtraceSetRegs(pid, &regs)
+	err = unix.PtraceSetRegs(tid, &regs)
 	if err != nil {
 		return fmt.Errorf("PTRACE_SETREGS failed: %w", err)
 	}

@@ -149,6 +149,104 @@ func TestThreadGroupCountersAreShared(t *testing.T) {
 	}
 }
 
+// TestAttachThreadIsIdempotent — EVENT_CLONE and the newly-cloned
+// thread's initial SIGSTOP can race; either path calls AttachThread,
+// and the second arrival must not double-register the tid.
+func TestAttachThreadIsIdempotent(t *testing.T) {
+	tg := newThreadGroup()
+	ts1 := tg.AttachThread(100)
+	ts2 := tg.AttachThread(100)
+
+	if ts1 != ts2 {
+		t.Fatalf("AttachThread(100) returned two different pointers: %p vs %p", ts1, ts2)
+	}
+	if got := tg.ThreadCount(); got != 1 {
+		t.Fatalf("ThreadCount after double-attach = %d, want 1", got)
+	}
+}
+
+// TestDetachThread removes the right ThreadState and leaves siblings
+// intact. Iteration order stays deterministic — the remaining tids
+// keep the slice order they had before the removal.
+func TestDetachThread(t *testing.T) {
+	tg := newThreadGroup()
+	tg.AttachThread(10)
+	tg.AttachThread(11)
+	tg.AttachThread(12)
+
+	tg.DetachThread(11)
+
+	if got := tg.ThreadCount(); got != 2 {
+		t.Fatalf("ThreadCount after detach(11) = %d, want 2", got)
+	}
+	if ts := tg.FindThread(11); ts != nil {
+		t.Fatalf("FindThread(11) after detach = %p, want nil", ts)
+	}
+	if ts := tg.FindThread(10); ts == nil || ts.tid != 10 {
+		t.Fatalf("FindThread(10) = %+v, want tid=10", ts)
+	}
+	if ts := tg.FindThread(12); ts == nil || ts.tid != 12 {
+		t.Fatalf("FindThread(12) = %+v, want tid=12", ts)
+	}
+
+	// Iteration order is 10, then 12 — original slice order minus 11.
+	tg.mu.Lock()
+	tids := []int{tg.threads[0].tid, tg.threads[1].tid}
+	tg.mu.Unlock()
+	if tids[0] != 10 || tids[1] != 12 {
+		t.Fatalf("post-detach iteration order = %v, want [10 12]", tids)
+	}
+}
+
+// TestDetachThreadUnknownTid is a no-op. EVENT_EXIT for main tracee
+// hits before worker detach, EVENT_EXIT for worker hits twice (once
+// before WIFEXITED, once on re-entry) — either way the code has to
+// handle "already removed" gracefully.
+func TestDetachThreadUnknownTid(t *testing.T) {
+	tg := newThreadGroup()
+	tg.AttachThread(10)
+
+	tg.DetachThread(999) // unknown
+	tg.DetachThread(10)
+	tg.DetachThread(10) // double-detach
+
+	if got := tg.ThreadCount(); got != 0 {
+		t.Fatalf("ThreadCount after double-detach = %d, want 0", got)
+	}
+}
+
+// TestFindThreadMiss returns nil cleanly. Routing (commit 3) will
+// branch on this for ESRCH on tkill(unknown-tid).
+func TestFindThreadMiss(t *testing.T) {
+	tg := newThreadGroup()
+	tg.AttachThread(10)
+
+	if ts := tg.FindThread(999); ts != nil {
+		t.Fatalf("FindThread(999) = %+v, want nil", ts)
+	}
+}
+
+// TestSetMainTidUpdatesMainThread — PtracePlatform.Run calls this
+// once the tracee pid is known; after SetMainTid, FindThread on the
+// tracee pid must resolve to the state NewSignalState created.
+func TestSetMainTidUpdatesMainThread(t *testing.T) {
+	ss := NewSignalState()
+	if ss.ThreadState.tid != 0 {
+		t.Fatalf("fresh main TS tid = %d, want 0", ss.ThreadState.tid)
+	}
+
+	ss.SetMainTid(12345)
+	if ss.ThreadState.tid != 12345 {
+		t.Fatalf("after SetMainTid(12345) tid = %d, want 12345", ss.ThreadState.tid)
+	}
+	if ts := ss.ThreadGroup.FindThread(12345); ts != ss.ThreadState {
+		t.Fatalf("FindThread(12345) = %p, want main TS %p", ts, ss.ThreadState)
+	}
+	if ts := ss.ThreadGroup.FindThread(0); ts != nil {
+		t.Fatalf("FindThread(0) after SetMainTid = %+v, want nil", ts)
+	}
+}
+
 // TestSignalStateShim confirms the SignalState shim correctly
 // promotes fields and methods from both embedded types, and that
 // both legs point at the same underlying state (i.e. modifications

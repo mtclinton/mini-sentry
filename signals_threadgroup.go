@@ -74,6 +74,71 @@ func (tg *ThreadGroup) addThreadLocked(tid int) *ThreadState {
 	return ts
 }
 
+// AttachThread registers a ThreadState for tid on this group and
+// returns it. If tid is already registered, the existing ThreadState
+// is returned unchanged — ptrace can report EVENT_CLONE and the
+// child's initial SIGSTOP in either order, and callers handle both
+// by going through AttachThread, so idempotence is required.
+func (tg *ThreadGroup) AttachThread(tid int) *ThreadState {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	for _, ts := range tg.threads {
+		if ts.tid == tid {
+			return ts
+		}
+	}
+	return tg.addThreadLocked(tid)
+}
+
+// DetachThread removes the ThreadState with the given tid from this
+// group. No-op if tid isn't registered (covers double-detach from
+// e.g. EVENT_EXIT followed by the final WIFEXITED reap). After
+// detach, routing (commit 3) will not pick this tid.
+func (tg *ThreadGroup) DetachThread(tid int) {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	for i, ts := range tg.threads {
+		if ts.tid == tid {
+			tg.threads = append(tg.threads[:i], tg.threads[i+1:]...)
+			return
+		}
+	}
+}
+
+// FindThread returns the ThreadState for tid, or nil if not
+// registered. Commit 2 uses this to route per-thread state updates
+// (mask, altstack) to the right thread when handlers fire.
+func (tg *ThreadGroup) FindThread(tid int) *ThreadState {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	for _, ts := range tg.threads {
+		if ts.tid == tid {
+			return ts
+		}
+	}
+	return nil
+}
+
+// ThreadCount returns the number of live threads in the group. For
+// tests and for the exit-banner summary.
+func (tg *ThreadGroup) ThreadCount() int {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	return len(tg.threads)
+}
+
+// SetMainTid rewrites the tid of the implicit main ThreadState that
+// NewSignalState created with tid=0. PtracePlatform.Run calls this
+// as soon as it knows the tracee pid, so the thread registered at
+// NewSignalState time ends up keyed correctly for routing.
+func (ss *SignalState) SetMainTid(tid int) {
+	ss.ThreadGroup.mu.Lock()
+	defer ss.ThreadGroup.mu.Unlock()
+	if ss.ThreadState != nil {
+		ss.ThreadState.tid = tid
+	}
+}
+
 // ThreadState is the per-thread signal state. Points back to its
 // ThreadGroup for the shared mutex and disposition table.
 type ThreadState struct {
