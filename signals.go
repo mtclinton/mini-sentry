@@ -31,10 +31,15 @@ package main
 // Phase 3b will remove the passthrough and make the mirror authoritative
 // — at that point the Sentry needs to construct sigreturn frames and
 // emulate rt_sigreturn, which is a real engineering project.
+//
+// Phase 3c commit 1 (ADR 002) splits the state across ThreadGroup and
+// ThreadState. SignalState is now a shim that embeds one of each and
+// routes every public method to the single main thread. Existing
+// call sites keep working unchanged; multi-thread routing lands in
+// commit 3 after TRACECLONE wires in commit 2.
 
 import (
 	"fmt"
-	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -152,175 +157,34 @@ type sigactionLayout struct {
 }
 
 // SignalState is the per-Sentry mirror of the tracee's signal
-// disposition table. It lives on the Sentry (single-threaded tracee
-// in mini-sentry today), protected by its own mutex so the platform
-// wait loop — which runs on a different code path than HandleSyscall
-// — can read it without taking s.mu.
+// disposition table. As of ADR 002 commit 1 it is a shim over a
+// ThreadGroup + a single main ThreadState; every public method is
+// promoted from the embedded types so the existing API is unchanged.
 //
-// Maps to: gVisor's kernel.SignalHandlers (pkg/sentry/kernel/signal_handlers.go).
+// Field access through embedding is intentional: tests reach through
+// `ss.mask`, `ss.generated`, etc. The embedded ThreadState and
+// ThreadGroup promote those fields directly so signals_test.go
+// continues to work unmodified.
+//
+// Maps to: gVisor's kernel.SignalHandlers + Task signal slice. The
+// combined type exists purely because mini-sentry currently has a
+// single tracee; commit 3 will split the API along TG/TS lines once
+// there's more than one thread to route to.
 type SignalState struct {
-	mu sync.Mutex
-
-	// actions[signum] is the current disposition, or zero-value
-	// (SIG_DFL) for signals the guest has never touched.
-	actions [nSig]SigAction
-
-	// mask is the signal mask — signals that are blocked from
-	// delivery. Matches what the guest last set via rt_sigprocmask.
-	mask sigset
-
-	// pending is the FIFO of signals queued for Sentry-driven delivery.
-	// Enqueue appends; DequeueUnblocked pops the first entry that isn't
-	// currently masked. Unblockable signals (SIGKILL/SIGSTOP) bypass
-	// the mask check in DequeueUnblocked.
-	pending []pendingSignal
-
-	// altStack is the guest-installed alternate signal stack. Mirrored
-	// on sigaltstack(2) writes; read by deliverOne to decide whether an
-	// SA_ONSTACK handler's frame is anchored on the altstack instead of
-	// the main stack. Zero-value means "no altstack installed" (the
-	// guest hasn't called sigaltstack yet).
-	altStack StackT
-
-	// counters for observability.
-	delivered map[int]int // signum → times actually forwarded to guest
-	ignored   map[int]int // signum → times suppressed by SIG_IGN mirror
-	generated map[int]int // signum → times guest sent a signal via kill/tkill
-	installed map[int]int // signum → times a new handler was installed
+	*ThreadGroup
+	*ThreadState
 }
 
-// NewSignalState returns an empty SignalState. All dispositions default
-// to SIG_DFL with an empty mask, matching a freshly-forked process.
+// NewSignalState returns a SignalState wrapping a fresh ThreadGroup
+// with one implicit main ThreadState attached. All dispositions
+// default to SIG_DFL with an empty mask, matching a freshly-forked
+// process.
 func NewSignalState() *SignalState {
-	return &SignalState{
-		delivered: make(map[int]int),
-		ignored:   make(map[int]int),
-		generated: make(map[int]int),
-		installed: make(map[int]int),
-	}
-}
-
-// SetAction records a new disposition for signum and returns the
-// previous one. Called from sysRtSigaction under the Sentry mutex —
-// SignalState keeps its own mutex so the platform's concurrent reads
-// in the wait loop don't need to take s.mu.
-func (ss *SignalState) SetAction(signum int, act SigAction) SigAction {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	if signum < 1 || signum >= nSig {
-		return SigAction{}
-	}
-	old := ss.actions[signum]
-	ss.actions[signum] = act
-	ss.installed[signum]++
-	return old
-}
-
-// GetAction returns the current disposition for signum. Safe for
-// concurrent readers (platform wait loop).
-func (ss *SignalState) GetAction(signum int) SigAction {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	if signum < 1 || signum >= nSig {
-		return SigAction{}
-	}
-	return ss.actions[signum]
-}
-
-// SetMask records a new signal mask. how is one of SIG_BLOCK,
-// SIG_UNBLOCK, SIG_SETMASK (the rt_sigprocmask ABI). Returns the
-// previous mask so the caller can write it back to *oldset.
-func (ss *SignalState) SetMask(how int, set sigset) sigset {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	old := ss.mask
-	switch how {
-	case 0: // SIG_BLOCK
-		ss.mask |= set
-	case 1: // SIG_UNBLOCK
-		ss.mask &^= set
-	case 2: // SIG_SETMASK
-		ss.mask = set
-	}
-	return old
-}
-
-// GetMask returns the current mask.
-func (ss *SignalState) GetMask() sigset {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	return ss.mask
-}
-
-// SetAltStack records a new alternate signal stack and returns the
-// previous one. Called from sysSigaltstack under the Sentry's own
-// serialization; we keep the lock here so platform-loop readers
-// (deliverOne) see a consistent snapshot without touching s.mu.
-func (ss *SignalState) SetAltStack(as StackT) StackT {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	old := ss.altStack
-	ss.altStack = as
-	return old
-}
-
-// GetAltStack returns the mirrored altstack. Safe for concurrent reads.
-func (ss *SignalState) GetAltStack() StackT {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	return ss.altStack
-}
-
-// AltStackUsable reports whether the mirrored altstack is installed,
-// enabled, and big enough to park an rt_sigframe on. deliverOne uses
-// this to gate SA_ONSTACK frame placement; an unusable altstack falls
-// back to main-stack delivery (matching the kernel's behavior for a
-// guest that set SA_ONSTACK without a valid sigaltstack).
-func (ss *SignalState) AltStackUsable() bool {
-	as := ss.GetAltStack()
-	if as.SS_flags&ssDisable != 0 {
-		return false
-	}
-	if as.SS_sp == 0 || as.SS_size < minSigStkSz {
-		return false
-	}
-	return true
-}
-
-// IsBlocked reports whether signum is currently blocked by the mask.
-// Used by the platform wait loop for routing decisions. SIGKILL and
-// SIGSTOP are never blockable — we special-case them here because a
-// misbehaving guest might still try to set the bit.
-func (ss *SignalState) IsBlocked(signum int) bool {
-	if signum == int(unix.SIGKILL) || signum == int(unix.SIGSTOP) {
-		return false
-	}
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	return ss.mask.has(signum)
-}
-
-// CountGenerated bumps the counter for a signal the guest generated
-// (via kill / tkill / tgkill). Purely observational.
-func (ss *SignalState) CountGenerated(signum int) {
-	ss.mu.Lock()
-	ss.generated[signum]++
-	ss.mu.Unlock()
-}
-
-// countDelivered / countIgnored are called by the platform wait loop
-// to keep the observability counters honest. Separate methods so the
-// hot path doesn't take the mutex through a bigger API.
-func (ss *SignalState) countDelivered(signum int) {
-	ss.mu.Lock()
-	ss.delivered[signum]++
-	ss.mu.Unlock()
-}
-
-func (ss *SignalState) countIgnored(signum int) {
-	ss.mu.Lock()
-	ss.ignored[signum]++
-	ss.mu.Unlock()
+	tg := newThreadGroup()
+	tg.mu.Lock()
+	ts := tg.addThreadLocked(0)
+	tg.mu.Unlock()
+	return &SignalState{ThreadGroup: tg, ThreadState: ts}
 }
 
 // String returns a short human-readable summary for debug logs.
