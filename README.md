@@ -41,11 +41,19 @@ Then run them in the sandbox:
 ./sentry-exec ./samples/pwd                    # → "/"
 ```
 
-Everything works under `--platform=seccomp` too:
+### Pick a platform
+
+mini-sentry ships two interception platforms, selectable with `--platform`:
+
+- **`ptrace`** (default) — `PTRACE_SYSEMU` stops the guest on *every* syscall and round-trips it to the Sentry. Simple and correct, but every `getpid` pays a full ptrace context-switch.
+- **`seccomp`** — a seccomp-BPF filter routes emulated syscalls to the Sentry via `SECCOMP_RET_USER_NOTIF` and lets everything else (getpid, mmap, futex, …) hit the real kernel directly. This is the same architectural pattern gVisor's **systrap** platform uses. Much faster, at the cost of a more complex bootstrap.
 
 ```bash
 ./sentry-exec --platform=seccomp ./samples/cat /etc/os-release
+./sentry-exec --platform=seccomp --benchmark ./cmd/guest/guest   # getpid() hot loop
 ```
+
+Signal delivery (Phase 3) is ptrace-only today — the Sentry-side signal frame path needs `PTRACE_GETREGS`/`SETREGS` to rewrite the tracee's stack. Under seccomp the tests that exercise real handlers skip cleanly.
 
 If your distro provides `busybox-static` (`sudo apt-get install -y busybox-static` on Debian/Ubuntu) that works as well:
 
@@ -100,7 +108,7 @@ A couple of caveats worth naming outright:
 
 ## Architecture → gVisor Mapping
 
-This project has 5 files that map directly to gVisor's architecture:
+The core files map directly to gVisor's architecture:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -125,11 +133,14 @@ This project has 5 files that map directly to gVisor's architecture:
 
 | mini-sentry | gVisor | What it does |
 |---|---|---|
-| `platform.go` | `pkg/sentry/platform/` | Intercepts syscalls. We use ptrace; gVisor uses systrap (seccomp+SIGSYS), ptrace, or KVM |
+| `platform.go` / `platform_seccomp.go` | `pkg/sentry/platform/` | Intercepts syscalls. We ship both ptrace and seccomp (`SECCOMP_RET_USER_NOTIF`); gVisor ships ptrace, systrap, and KVM |
 | `regs_amd64.go` / `regs_arm64.go` | `pkg/sentry/arch/` | Architecture-specific register layout for reading syscall args |
 | `sentry.go` | `pkg/sentry/kernel/` | The userspace kernel — dispatches syscalls to handlers |
 | `handlers.go` | `pkg/sentry/syscalls/linux/` | Individual syscall implementations (read, write, open, etc.) |
-| `vfs.go` | `pkg/sentry/vfs/` + Gofer | Virtual filesystem that controls what files the sandbox can see |
+| `signals.go` / `signals_threadgroup.go` / `signals_pending.go` | `pkg/sentry/kernel/signal*.go` | Signal disposition mirror, per-thread masks + pending queues, thread-group routing |
+| `frame_amd64.go` / `deliver_amd64.go` / `handlers_signals_amd64.go` | `pkg/sentry/arch/signal_amd64.go` + kernel | Build/decode `rt_sigframe`, deliver handlers by rewriting the tracee stack, emulate `rt_sigreturn` |
+| `vfs.go` / `vfs_gofer.go` / `gofer.go` | `pkg/sentry/vfs/` + Gofer | Virtual filesystem — in-memory or out-of-process gofer serving a restricted view of the host |
+| `network.go` | `pkg/sentry/socket/` + netstack | Outbound CIDR:port allow/deny policy applied to `connect`/`sendto` |
 
 ## How It Works
 
@@ -171,40 +182,63 @@ Even if an attacker compromises the Sentry, they can't open arbitrary files — 
 
 Our `vfs.go` combines both roles: it's the Sentry's in-memory map of "what files exist." When the guest calls `open("/etc/hostname")`, our handler checks this map — not the host's `/etc/hostname`. The guest sees `mini-sentry-sandbox`, not your real hostname.
 
+### The Signal Machinery (Phase 3)
+
+Getting signals right means the Sentry, not the kernel, owns handler dispatch — otherwise a guest handler would see the *host's* register state, not the emulated one. We do this in three layers:
+
+- **3a — the disposition mirror.** `signals.go` / `signals_threadgroup.go` / `signals_pending.go` mirror everything the kernel would normally own: the 64-entry sigaction table, per-thread signal masks, and a per-thread pending queue. `rt_sigaction`, `rt_sigprocmask`, and `sigaltstack` are intercepted and mutate the mirror only — the kernel's view stays untouched.
+- **3b — Sentry-side frame delivery.** `frame_amd64.go` builds an x86_64 `rt_sigframe` (ucontext + fpstate + siginfo + pretcode) on the guest's stack via `process_vm_writev`; `deliver_amd64.go` rewrites `RIP` to the handler and `RSP` to the frame; `handlers_signals_amd64.go` emulates `rt_sigreturn` by reading the frame back and restoring `PTRACE_SETREGS` + `SETFPREGS` + the saved mask. The kernel never sees the handler run.
+- **3c — per-thread routing.** `PTRACE_O_TRACECLONE` attaches every guest thread as it's spawned so the Sentry tracks a full `ThreadGroup` / `ThreadState` pair. `kill`/`tkill`/`tgkill` route by spoofed tgid/tid but resolve to the *caller's* host tid for self-sends; group-directed kills pick the first thread whose mask accepts the signal.
+
+`cmd/guest/main.go` Tests 7 and 9 prove the round-trip end-to-end: a raw `rt_sigaction`-installed pure-asm SIGUSR1 handler that atomically bumps a counter, driven by `kill(self, SIGUSR1)` and by four goroutines racing `tgkill` from dedicated OS threads.
+
 ## Implemented Syscalls
 
 | Syscall | Handler | Notes |
 |---|---|---|
-| `read` | sysRead | Serves data from VFS or passes through for stdio |
-| `write` | sysWrite | Passes through to host stdout/stderr |
-| `openat` | sysOpenat | Opens files from virtual filesystem only |
+| **File I/O** | | |
+| `read` / `pread64` | sysRead / sysPread64 | Serves data from VFS or passes through for stdio |
+| `write` / `pwrite64` | sysWrite / sysPwrite64 | Passes through to host stdout/stderr |
+| `openat` | sysOpenat | Opens files from VFS or gofer-served mounts |
 | `close` | sysClose | Closes virtual file descriptors |
-| `fstat` | sysStat | Returns fabricated stat structures |
 | `lseek` | sysLseek | Seeks within virtual files |
-| `brk` | sysBrk | Manages the program break (heap) |
-| `mmap` | sysMmap | Handles anonymous memory mappings |
-| `mprotect` | — | Accepted (no-op) |
-| `munmap` | — | Accepted (no-op) |
-| `ioctl` | sysIoctl | TCGETS → ENOTTY (not a terminal) |
-| `fcntl` | sysFcntl | Basic fd flag operations |
+| `fstat` / `statx` | sysStat / sysStatx | Returns fabricated stat structures |
+| `statfs` | sysStatfs | Returns fabricated filesystem stats |
+| `faccessat` | sysFaccessat | VFS-aware access check |
 | `getdents64` | sysGetdents64 | Lists virtual directory contents |
-| `arch_prctl` | sysArchPrctl | TLS setup (x86_64) |
-| `prlimit64` | sysPrlimit64 | Returns permissive resource limits |
+| `ioctl` / `fcntl` | sysIoctl / sysFcntl | TCGETS → ENOTTY, basic fd flag ops |
+| `fadvise64` / `copy_file_range` | — | Accepted no-ops for sequential readers |
+| **Memory & process** | | |
+| `brk` / `mmap` | sysBrk / sysMmap | Program break + anonymous mappings |
+| `mprotect` / `munmap` | — | Accepted (no-op) |
+| `arch_prctl` / `prctl` | sysArchPrctl / sysPrctl | TLS setup (x86_64), PR_SET_NAME, etc. |
+| `prlimit64` | sysPrlimit64 | Mirrors `--rlimit` overrides |
 | `getrandom` | sysGetrandom | Fills buffer from crypto/rand |
-| `getpid` | — | Returns 1 (sandbox init) |
-| `getuid/gid` | — | Returns 0 (fake root) |
-| Everything else | — | Returns `ENOSYS` (not implemented) |
+| `getpid` / `gettid` | — | Returns 1 (sandbox init / sole thread from guest's view) |
+| `getuid` / `getgid` / `geteuid` / `getegid` | — | Returns 0 (fake root) |
+| `clone` | — | Passthrough with `PTRACE_O_TRACECLONE` so new threads attach to the Sentry |
+| **Signals (Phase 3, x86_64)** | | |
+| `rt_sigaction` | sysRtSigaction | Mirrors the 64-entry sigaction table inside the Sentry |
+| `rt_sigprocmask` | sysRtSigprocmask | Per-thread signal mask, mirror-only |
+| `sigaltstack` | sysSigaltstack | Mirrors alternate signal stack per thread |
+| `rt_sigreturn` | sysRtSigreturn | Decodes rt_sigframe and restores tracee regs + fp + mask |
+| `kill` / `tkill` / `tgkill` | sysKill / sysTkill / sysTgkill | Route by spoofed (tgid, tid) → caller's host tid |
+| **Network policy** | | |
+| `socket` / `connect` / `sendto` | sysSocket / sysConnect / sysSendto | `--net-allow` / `--net-deny` CIDR:port filter |
+| **Everything else** | — | Returns `ENOSYS` |
+
+> arm64 currently mirrors disposition but skips Sentry-side frame delivery — signals pass through to the host kernel. x86_64 is the reference path.
 
 ## Extending It
 
 Some ideas for making this more educational:
 
 1. **Add verbose mode** — Change `logWriter()` in `sentry.go` to return `os.Stderr` to see every intercepted syscall
-2. **Add a seccomp platform** — Replace ptrace with `SECCOMP_RET_USER_NOTIF` (the modern approach, similar to gVisor's systrap)
-3. **Add network interception** — Implement `socket`, `connect`, `sendto`, `recvfrom` using gVisor's netstack concepts
-4. **Add a real Gofer** — Split the VFS into a separate process communicating over a pipe (like gVisor's LISAFS)
-5. **Add syscall filtering** — Block specific syscalls (like `ptrace` itself) to prevent sandbox escape
-6. **Run real programs** — Handle more syscalls to support `ls`, `cat`, `python3`, etc.
+2. **arm64 signal delivery** — Port `frame_amd64.go` / `deliver_amd64.go` / `handlers_signals_amd64.go` to arm64. The ucontext layout + SVE state is the tricky part; disposition + routing already work.
+3. **Timers** — `nanosleep`, `clock_gettime`, `setitimer`, `timer_create`. Today `nanosleep` passes through; a Sentry-driven timer wheel would let the guest observe a virtual clock.
+4. **Dynamic ELF loader** — File-backed `mmap` + a real `ld-linux-x86-64.so.2` identity-mount path would lift the "static binaries only" caveat.
+5. **Syscall filtering policy** — Extend `sentry.go` with per-spec allow/deny rules (like seccomp profiles) to prove out defense-in-depth beyond the platform's BPF filter.
+6. **Run real programs** — Handle more syscalls (`epoll`, `eventfd`, `inotify`, `pidfd_*`) to support Python, Node, redis-server, etc.
 
 ## Requirements
 
@@ -216,14 +250,21 @@ Some ideas for making this more educational:
 
 gVisor's production implementation adds layers we skip:
 
-- **Seccomp on the Sentry itself** — The Sentry is restricted to ~68 host syscalls by its own seccomp filter. Even if the Sentry has a bug, it can't call arbitrary kernel syscalls.
-- **Separate Gofer process** — Filesystem access goes through an isolated process with minimal permissions.
+- **Seccomp on the Sentry itself** — The Sentry is restricted to ~68 host syscalls by its own seccomp filter. Even if the Sentry has a bug, it can't call arbitrary kernel syscalls. (We ship `--platform=seccomp` to intercept the *guest*, not to lock down the Sentry — that's a separate filter gVisor applies.)
 - **Full memory management** — gVisor tracks every page of application memory using a host memfd, with proper COW, demand paging, and NUMA awareness.
-- **Complete networking stack** — gVisor's netstack implements TCP/IP from scratch in Go, so the sandbox never opens a real socket.
-- **Multi-process support** — fork(), clone(), threads, signals, IPC — the full Linux process model.
-- **237 syscalls** — We implement ~20. gVisor implements 237.
+- **Complete networking stack** — gVisor's netstack implements TCP/IP from scratch in Go, so the sandbox never opens a real socket. Ours enforces an outbound CIDR:port policy but still opens real host sockets.
+- **IPC, pidns, cgroups** — fork/clone/threads/signals work here, but System V IPC, POSIX message queues, namespaces, and cgroup integration are all gVisor-only.
+- **237 syscalls** — We implement ~35 emulated + a handful of passthroughs. gVisor implements 237.
 
 But the architecture is identical. This is how it works, just at a smaller scale.
+
+## Design Notes
+
+The signal subsystem has enough moving parts (Sentry-side frame building, per-thread routing via TRACECLONE, the Task/ThreadGroup split) that it earned its own ADR trail:
+
+- [ADR 001 — Phase 3b pure-state signals](docs/adr/001-phase3b-pure-state-signals.md) — Sentry-owned `rt_sigframe` and `rt_sigreturn` (amd64).
+- [ADR 002 — Phase 3c multi-thread routing](docs/adr/002-phase3c-multithread-signal-routing.md) — `PTRACE_O_TRACECLONE` + per-thread pending queues, mirroring gVisor's Task/ThreadGroup seam.
+- [ADR 003 — Phase 3 closeout](docs/adr/003-phase3-closeout.md) — where the project stops, the arm64 gap, and the remaining backlog.
 
 ## License
 
