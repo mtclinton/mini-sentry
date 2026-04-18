@@ -46,9 +46,20 @@ type deliveryResult struct {
 // (further pending signals stay queued until the handler's
 // rt_sigreturn triggers the next drain). Safe to call when the queue
 // is empty — returns zero result.
+//
+// pid is the tid of the thread the platform is about to resume. We
+// only drain signals targeted at that thread — its own thread-directed
+// queue plus any group-directed signal it's eligible to receive per
+// canReceiveSignalLocked (mask gate). If FindThread misses (race with
+// detach, or seccomp fallback path), fall back to the main TS so the
+// queue still drains rather than stranding signals.
 func (p *PtracePlatform) deliverPending(pid int) (deliveryResult, error) {
+	ts := p.sentry.signals.FindThread(pid)
+	if ts == nil {
+		ts = p.sentry.signals.ThreadState
+	}
 	for {
-		sig, ok := p.sentry.signals.DequeueUnblocked()
+		sig, ok := ts.DequeueUnblocked()
 		if !ok {
 			return deliveryResult{}, nil
 		}
@@ -64,7 +75,7 @@ func (p *PtracePlatform) deliverPending(pid int) (deliveryResult, error) {
 			}
 			return deliveryResult{terminate: sig.signo}, nil
 		default:
-			if err := p.deliverOne(pid, sig, act); err != nil {
+			if err := p.deliverOne(pid, ts, sig, act); err != nil {
 				return deliveryResult{}, err
 			}
 			p.sentry.signals.countDelivered(sig.signo)
@@ -85,7 +96,7 @@ func (p *PtracePlatform) deliverPending(pid int) (deliveryResult, error) {
 //
 // Mask update matches POSIX: current | sa_mask, plus signo itself
 // (automatic one-shot defer). SA_NODEFER is commit 4's job.
-func (p *PtracePlatform) deliverOne(pid int, sig pendingSignal, act SigAction) error {
+func (p *PtracePlatform) deliverOne(pid int, ts *ThreadState, sig pendingSignal, act SigAction) error {
 	var regs unix.PtraceRegs
 	if err := unix.PtraceGetRegs(pid, &regs); err != nil {
 		return fmt.Errorf("deliverOne GETREGS: %w", err)
@@ -95,9 +106,9 @@ func (p *PtracePlatform) deliverOne(pid int, sig pendingSignal, act SigAction) e
 		return fmt.Errorf("deliverOne GETFPREGS: %w", err)
 	}
 	info := siginfoFromBytes(sig.info)
-	preMask := p.sentry.signals.GetMask()
+	preMask := ts.GetMask()
 	frameRegs := syscallRegsFromUnix(&regs)
-	altstack := p.sentry.signals.GetAltStack()
+	altstack := ts.GetAltStack()
 	frameTop := chooseFrameTop(act, altstack, regs.Rsp)
 	frame, newRsp := BuildRtSigframe(&frameRegs, &fpregs, info, preMask, act.restorer, altstack, frameTop)
 	writeToChild(pid, newRsp, frame)
@@ -114,7 +125,7 @@ func (p *PtracePlatform) deliverOne(pid int, sig pendingSignal, act SigAction) e
 	if sig.signo >= 1 && sig.signo < nSig && act.flags&saNoDefer == 0 {
 		handlerMask |= 1 << uint(sig.signo-1)
 	}
-	p.sentry.signals.SetMask(2, handlerMask) // SIG_SETMASK
+	ts.SetMask(2, handlerMask) // SIG_SETMASK
 	if act.flags&saResetHand != 0 {
 		p.sentry.signals.SetAction(sig.signo, SigAction{})
 	}

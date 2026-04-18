@@ -45,6 +45,13 @@ type ThreadGroup struct {
 	// this slice in attach order for deterministic routing.
 	threads []*ThreadState
 
+	// groupPending is the queue of group-directed signals waiting on a
+	// receiver. A signal sent via kill(tgid, sig) lands here; the
+	// drain path walks tg.threads in slice order and the first thread
+	// that isn't blocking signo dequeues it. Matches gVisor's
+	// ThreadGroup.pendingSignals (thread_group.go:74).
+	groupPending []pendingSignal
+
 	// Observability counters — group-wide so a single kill(pid, sig)
 	// routed to any thread still bumps the same `delivered` counter
 	// the tests read. generated/delivered/ignored/installed

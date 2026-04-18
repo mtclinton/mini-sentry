@@ -95,13 +95,15 @@ func main() {
 	}
 	fmt.Println()
 
-	// Test 7: Exercise Sentry-side signal delivery (Phase 3b commit 3)
-	// via the SIG_IGN drop path. We raw-syscall rt_sigaction(SIG_IGN)
-	// for SIGUSR1 to bypass Go's os/signal (which routes delivery
-	// through a non-main gsignal thread we don't trace — multi-thread
-	// routing is a later Phase 3c concern). Then kill(self, SIGUSR1):
-	// the Sentry's pending-queue drain sees SIG_IGN and drops the
-	// entry. kill() returns 0 and execution continues.
+	// Test 7 exercises the Sentry's pending-queue drain via the SIG_IGN
+	// path. Raw-syscall rt_sigaction(SIG_IGN) for SIGUSR1 sidesteps
+	// Go's os/signal (which sets up a multi-thread routing tree the
+	// Sentry's multi-thread delivery can't yet round-trip: ADR 002 §6
+	// commit 4 will introduce a proper multi-threaded handler test).
+	// kill(self, SIGUSR1) hits sysKill → group queue → drain sees
+	// SIG_IGN and drops the entry. kill() returns 0 and execution
+	// continues, proving commit 3's group-routing path lands on an
+	// eligible thread and the drain short-circuits cleanly.
 	fmt.Printf("Test 7 — Signals (SIG_IGN drop via Sentry queue)\n")
 	if err := installSigIgn(syscall.SIGUSR1); err != nil {
 		fmt.Printf("  ERROR: rt_sigaction(SIGUSR1, SIG_IGN): %v\n", err)

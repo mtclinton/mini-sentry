@@ -1307,7 +1307,7 @@ func (s *Sentry) sysSigaltstack(_, pid int, sc SyscallArgs) uint64 {
 			as.SS_sp = binary.LittleEndian.Uint64(buf[0:8])
 			as.SS_flags = int32(binary.LittleEndian.Uint32(buf[8:12]))
 			as.SS_size = binary.LittleEndian.Uint64(buf[16:24])
-			s.signals.SetAltStack(as)
+			s.callerThread(pid).SetAltStack(as)
 			_, _ = fmt.Fprintf(logWriter(),
 				"  [sentry] sigaltstack: sp=0x%x size=%d flags=0x%x\n",
 				as.SS_sp, as.SS_size, as.SS_flags)
@@ -1343,14 +1343,15 @@ func (s *Sentry) sysRtSigprocmask(_, pid int, sc SyscallArgs) uint64 {
 		}
 	}
 
+	ts := s.callerThread(pid)
 	var oldMask sigset
 	if setPtr != 0 {
-		oldMask = s.signals.SetMask(how, newSet)
+		oldMask = ts.SetMask(how, newSet)
 	} else {
-		oldMask = s.signals.GetMask()
+		oldMask = ts.GetMask()
 	}
 	_, _ = fmt.Fprintf(logWriter(), "  [sentry] rt_sigprocmask: how=%d set=0x%x -> mask=0x%x\n",
-		how, uint64(newSet), uint64(s.signals.GetMask()))
+		how, uint64(newSet), uint64(ts.GetMask()))
 
 	if oldsetPtr != 0 {
 		var buf [8]byte
@@ -1379,35 +1380,62 @@ func (s *Sentry) sysKill(_, pid int, sc SyscallArgs) uint64 {
 		// 1 = guest's own PID (we spoof); 0 = "send to my process
 		// group" (we're alone); -1 = "every process I can reach"
 		// (ditto, just us). In all three cases the target is the
-		// tracee itself.
-		return s.sendSelfSignal(pid, signum, "kill")
+		// tracee itself. kill(2) is process-directed — queue onto
+		// the group so the drain picks whichever thread isn't
+		// blocking the signal (ADR 002 §3).
+		return s.sendSelfSignal(pid, signum, "kill", signalGroupDirected)
 	}
 	s.requestPassthrough(nil)
 	return 0
 }
 
 // sysTkill — tkill(tid, sig). The tracee's view of its own TID is 1
-// (see SYS_GETTID), so the same rewrite applies.
+// (see SYS_GETTID), so the same rewrite applies. tkill(2) is strictly
+// thread-directed: the signal lands on the calling thread's own queue
+// and the drain honors that thread's mask alone.
 func (s *Sentry) sysTkill(_, pid int, sc SyscallArgs) uint64 {
 	targetTid := int64(sc.Args[0])
 	signum := int(sc.Args[1])
 	if targetTid == 1 {
-		return s.sendSelfSignal(pid, signum, "tkill")
+		return s.sendSelfSignal(pid, signum, "tkill", signalThreadDirected)
 	}
 	s.requestPassthrough(nil)
 	return 0
 }
 
-// sysTgkill — tgkill(tgid, tid, sig).
+// sysTgkill — tgkill(tgid, tid, sig). Thread-directed like tkill.
 func (s *Sentry) sysTgkill(_, pid int, sc SyscallArgs) uint64 {
 	tgid := int64(sc.Args[0])
 	tid := int64(sc.Args[1])
 	signum := int(sc.Args[2])
 	if tgid == 1 && tid == 1 {
-		return s.sendSelfSignal(pid, signum, "tgkill")
+		return s.sendSelfSignal(pid, signum, "tgkill", signalThreadDirected)
 	}
 	s.requestPassthrough(nil)
 	return 0
+}
+
+// signalRouting distinguishes kill(2) (group queue) from tkill(2)/
+// tgkill(2) (queue onto the calling thread).
+type signalRouting int
+
+const (
+	signalGroupDirected signalRouting = iota
+	signalThreadDirected
+)
+
+// callerThread resolves the ThreadState for tid. Every tid that
+// reaches a syscall handler went through AttachThread (either at
+// SetMainTid time or on the initial SIGSTOP / EVENT_CLONE for a
+// worker), so the lookup normally succeeds. If it somehow misses
+// (uncommon edge case: seccomp mode with no ptrace tracking, or a
+// thread that exited mid-syscall), fall back to the main TS so
+// downstream state updates still land somewhere and we don't NPE.
+func (s *Sentry) callerThread(tid int) *ThreadState {
+	if ts := s.signals.FindThread(tid); ts != nil {
+		return ts
+	}
+	return s.signals.ThreadState
 }
 
 // sendSelfSignal queues a self-targeted signal onto SignalState.pending.
@@ -1426,7 +1454,7 @@ func (s *Sentry) sysTgkill(_, pid int, sc SyscallArgs) uint64 {
 // consistent with the self-raise origin. "pid" here is the spoofed
 // tgid=1 and "uid" is 0 because that's what the guest sees via our
 // getpid/getuid handlers.
-func (s *Sentry) sendSelfSignal(pid, signum int, from string) uint64 {
+func (s *Sentry) sendSelfSignal(pid, signum int, from string, route signalRouting) uint64 {
 	if signum == 0 {
 		return 0
 	}
@@ -1451,7 +1479,12 @@ func (s *Sentry) sendSelfSignal(pid, signum int, from string) uint64 {
 		return 0
 	}
 	info := buildSelfSiginfo(signum)
-	s.signals.Enqueue(signum, info)
+	switch route {
+	case signalThreadDirected:
+		s.callerThread(pid).Enqueue(signum, info)
+	default:
+		s.signals.EnqueueGroup(signum, info)
+	}
 	_, _ = fmt.Fprintf(logWriter(), "  [sentry] %s(self, %s) -> enqueued\n",
 		from, signalName(signum))
 	return 0

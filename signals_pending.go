@@ -56,13 +56,29 @@ func (ts *ThreadState) Enqueue(signo int, info [sigInfoBytes]byte) {
 // are unblockable and always dequeue if present. ok=false means the
 // queue is empty or every entry is blocked; callers that need to
 // distinguish use PendingCount.
+//
+// Precedence: thread-directed entries (ts.pending) outrank group-
+// directed entries (tg.groupPending). gVisor makes the same choice in
+// Task.dequeueSignalLocked (task_signals.go:~490) — targeted signals
+// win over group-directed ones within the same mask gate.
 func (ts *ThreadState) DequeueUnblocked() (pendingSignal, bool) {
 	ts.group.mu.Lock()
 	defer ts.group.mu.Unlock()
-	for i, p := range ts.pending {
-		if p.signo == int(unix.SIGKILL) || p.signo == int(unix.SIGSTOP) || !ts.mask.has(p.signo) {
-			ts.pending = append(ts.pending[:i], ts.pending[i+1:]...)
-			return p, true
+	if p, ok := dequeueUnblockedLocked(&ts.pending, ts.mask); ok {
+		return p, true
+	}
+	return dequeueUnblockedLocked(&ts.group.groupPending, ts.mask)
+}
+
+// dequeueUnblockedLocked pops the first entry in q that ts's mask
+// doesn't block. Shared between the per-thread and group queue
+// scans. Caller must hold tg.mu.
+func dequeueUnblockedLocked(q *[]pendingSignal, mask sigset) (pendingSignal, bool) {
+	for i, p := range *q {
+		if p.signo == int(unix.SIGKILL) || p.signo == int(unix.SIGSTOP) || !mask.has(p.signo) {
+			entry := p
+			*q = append((*q)[:i], (*q)[i+1:]...)
+			return entry, true
 		}
 	}
 	return pendingSignal{}, false
@@ -74,4 +90,57 @@ func (ts *ThreadState) PendingCount() int {
 	ts.group.mu.Lock()
 	defer ts.group.mu.Unlock()
 	return len(ts.pending)
+}
+
+// GroupPendingCount returns the group-directed queue length. Used by
+// tests and the exit banner; a non-zero value at teardown means a
+// group-directed signal was queued but never had an eligible thread
+// to receive it (every thread blocked it or the group emptied first).
+func (tg *ThreadGroup) GroupPendingCount() int {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	return len(tg.groupPending)
+}
+
+// EnqueueGroup appends a signal to the group-directed queue. Target
+// of kill(tgid, sig) and any other "send to the process" path. The
+// drain picks a receiver by walking tg.threads in slice order; see
+// findSignalReceiverLocked.
+func (tg *ThreadGroup) EnqueueGroup(signo int, info [sigInfoBytes]byte) {
+	if signo < 1 || signo >= nSig {
+		return
+	}
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	tg.groupPending = append(tg.groupPending, pendingSignal{signo: signo, info: info})
+}
+
+// canReceiveSignalLocked reports whether ts is eligible to receive
+// signo right now. Mirrors gVisor's Task.canReceiveSignalLocked
+// (task_signals.go:524): SIGKILL and SIGSTOP bypass the mask; every
+// other signal is gated on the thread's per-task signal mask.
+// Caller must hold tg.mu.
+func (tg *ThreadGroup) canReceiveSignalLocked(ts *ThreadState, signo int) bool {
+	if signo == int(unix.SIGKILL) || signo == int(unix.SIGSTOP) {
+		return true
+	}
+	return !ts.mask.has(signo)
+}
+
+// findSignalReceiverLocked picks the thread that should take a
+// group-directed signo. Walks tg.threads in attach order — the same
+// deterministic traversal as gVisor's findSignalReceiverLocked
+// (task_signals.go:550), minus the "prefer a thread already running"
+// hint (we always pick the first eligible thread because mini-sentry
+// has no notion of runnable state). Returns nil if every thread is
+// currently blocking signo — the signal stays on groupPending until
+// a thread unblocks it via rt_sigprocmask.
+// Caller must hold tg.mu.
+func (tg *ThreadGroup) findSignalReceiverLocked(signo int) *ThreadState {
+	for _, ts := range tg.threads {
+		if tg.canReceiveSignalLocked(ts, signo) {
+			return ts
+		}
+	}
+	return nil
 }

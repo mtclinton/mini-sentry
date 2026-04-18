@@ -76,7 +76,7 @@ func (s *Sentry) sysRtSigreturn(_, pid int, _ SyscallArgs) uint64 {
 		// than half-restore via ActionReturn.
 		sigLogf("SETFPREGS: %v", err)
 	}
-	s.signals.SetMask(2, mask) // SIG_SETMASK: sigreturn replaces wholesale
+	s.callerThread(pid).SetMask(2, mask) // SIG_SETMASK: sigreturn replaces wholesale
 	s.requestKeepRegs()
 	return 0
 }

@@ -23,9 +23,16 @@ import (
 // loop's drain on the next iteration picks up the work.
 func (p *PtracePlatform) handleSignalStop(pid int, sig syscall.Signal) (int, bool, error) {
 	info := ptraceGetsiginfo(pid)
-	p.sentry.signals.Enqueue(int(sig), info)
+	// AttachThread is idempotent — the stopping tid went through
+	// SIGSTOP/EVENT_CLONE registration already, but a brand-new thread
+	// whose first observable stop IS a signal-delivery stop (rare but
+	// legal) would otherwise miss its ThreadState. Enqueue lands on
+	// the thread-directed queue so the drain only looks at it when
+	// resuming this specific tid.
+	ts := p.sentry.signals.AttachThread(pid)
+	ts.Enqueue(int(sig), info)
 	_, _ = fmt.Fprintf(logWriter(),
-		"  [platform] signal-stop %s (%d) → enqueue\n",
-		signalName(int(sig)), int(sig))
+		"  [platform] signal-stop %s (%d) on tid=%d → enqueue\n",
+		signalName(int(sig)), int(sig), pid)
 	return 0, false, nil
 }

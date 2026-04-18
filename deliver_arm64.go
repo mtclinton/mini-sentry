@@ -31,8 +31,12 @@ type deliveryResult struct {
 // handler on the tracee's next resume. Unblocked-only dequeue keeps
 // the mask check point consistent with amd64.
 func (p *PtracePlatform) deliverPending(pid int) (deliveryResult, error) {
+	ts := p.sentry.signals.FindThread(pid)
+	if ts == nil {
+		ts = p.sentry.signals.ThreadState
+	}
 	for {
-		sig, ok := p.sentry.signals.DequeueUnblocked()
+		sig, ok := ts.DequeueUnblocked()
 		if !ok {
 			return deliveryResult{}, nil
 		}
