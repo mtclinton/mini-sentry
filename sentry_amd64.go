@@ -23,25 +23,25 @@ func (s *Sentry) addArchSyscalls() {
 	}
 	s.syscalls[unix.SYS_STAT] = SyscallEntry{
 		name: "stat",
-		handler: func(s *Sentry, pid int, sc SyscallArgs) uint64 {
+		handler: func(s *Sentry, tgid, tid int, sc SyscallArgs) uint64 {
 			// stat(path, statbuf) → newfstatat(AT_FDCWD, path, statbuf, 0)
 			sc.Args = [6]uint64{^uint64(99), sc.Args[0], sc.Args[1], 0, 0, 0}
-			return s.sysStat(pid, sc)
+			return s.sysStat(tgid, tid, sc)
 		},
 	}
 	s.syscalls[unix.SYS_LSTAT] = SyscallEntry{
 		name: "lstat",
-		handler: func(s *Sentry, pid int, sc SyscallArgs) uint64 {
+		handler: func(s *Sentry, tgid, tid int, sc SyscallArgs) uint64 {
 			sc.Args = [6]uint64{^uint64(99), sc.Args[0], sc.Args[1], 0, 0, 0}
-			return s.sysStat(pid, sc)
+			return s.sysStat(tgid, tid, sc)
 		},
 	}
 	// Legacy access() — rewrite as faccessat and reuse that handler.
 	s.syscalls[unix.SYS_ACCESS] = SyscallEntry{
 		name: "access",
-		handler: func(s *Sentry, pid int, sc SyscallArgs) uint64 {
+		handler: func(s *Sentry, tgid, tid int, sc SyscallArgs) uint64 {
 			sc.Args = [6]uint64{^uint64(99), sc.Args[0], sc.Args[1], 0, 0, 0}
-			return s.sysFaccessat(pid, sc)
+			return s.sysFaccessat(tgid, tid, sc)
 		},
 	}
 	// Legacy readlink() — thin wrapper around readlinkat semantics.
@@ -52,14 +52,14 @@ func (s *Sentry) addArchSyscalls() {
 	// Legacy open() — rewrite as openat(AT_FDCWD, ...).
 	s.syscalls[unix.SYS_OPEN] = SyscallEntry{
 		name: "open",
-		handler: func(s *Sentry, pid int, sc SyscallArgs) uint64 {
+		handler: func(s *Sentry, tgid, tid int, sc SyscallArgs) uint64 {
 			sc.Args = [6]uint64{^uint64(99), sc.Args[0], sc.Args[1], sc.Args[2], 0, 0}
-			return s.sysOpenat(pid, sc)
+			return s.sysOpenat(tgid, tid, sc)
 		},
 	}
 	s.syscalls[unix.SYS_DUP2] = SyscallEntry{
 		name:    "dup2",
-		handler: func(s *Sentry, _ int, sc SyscallArgs) uint64 { return s.sysDup2(sc) },
+		handler: func(s *Sentry, _, _ int, sc SyscallArgs) uint64 { return s.sysDup2(sc) },
 	}
 	// Legacy getdents (non-64) — reuse the 64-bit implementation. The
 	// struct layouts differ but musl/glibc prefer getdents64 anyway.

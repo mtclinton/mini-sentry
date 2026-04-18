@@ -21,7 +21,7 @@ import (
 // sysFaccessat handles faccessat(dirfd, pathname, mode, flags).
 // Also handles access() on amd64 (which glibc rewrites to faccessat).
 // We just check if the file exists in the VFS.
-func (s *Sentry) sysFaccessat(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysFaccessat(_, pid int, sc SyscallArgs) uint64 {
 	// dirfd := int32(sc.Args[0]) // AT_FDCWD = -100
 	pathPtr := sc.Args[1]
 	// mode := sc.Args[2]

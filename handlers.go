@@ -61,7 +61,7 @@ const maxTransfer = 16 * 1024 * 1024
 // In gVisor: vfs.FileDescription.Read() → specific filesystem implementation
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysRead(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysRead(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	buf := sc.Args[1]  // pointer in child's address space
 	count := sc.Args[2]
@@ -147,7 +147,7 @@ func (s *Sentry) sysRead(pid int, sc SyscallArgs) uint64 {
 // read ELF headers and program segments at specific offsets.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysPread64(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysPread64(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	buf := sc.Args[1]
 	count := sc.Args[2]
@@ -190,7 +190,7 @@ func (s *Sentry) sysPread64(pid int, sc SyscallArgs) uint64 {
 // (kernel-owned); virtual files are read-only.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysPwrite64(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysPwrite64(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 
 	if s.shouldPassthroughFD(fd) {
@@ -207,7 +207,7 @@ func (s *Sentry) sysPwrite64(pid int, sc SyscallArgs) uint64 {
 // In gVisor: vfs.FileDescription.Write()
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysWrite(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysWrite(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	buf := sc.Args[1]
 	count := sc.Args[2]
@@ -268,7 +268,7 @@ func (s *Sentry) sysWrite(pid int, sc SyscallArgs) uint64 {
 // a real file descriptor on the host.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysOpenat(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysOpenat(_, pid int, sc SyscallArgs) uint64 {
 	// dirfd := int32(sc.Args[0]) // AT_FDCWD = -100
 	pathPtr := sc.Args[1]
 	// flags := sc.Args[2]
@@ -376,11 +376,11 @@ func (s *Sentry) sysClose(sc SyscallArgs) uint64 {
 // The isFstat parameter distinguishes them — true for fstat, false for newfstatat.
 // On arm64, fstat doesn't exist as a syscall, so only newfstatat is called from
 // sentry.go. On amd64, fstat is dispatched from sentry_amd64.go.
-func (s *Sentry) sysStat(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysStat(_, pid int, sc SyscallArgs) uint64 {
 	return s.doStat(pid, sc, false)
 }
 
-func (s *Sentry) sysFstat(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysFstat(_, pid int, sc SyscallArgs) uint64 {
 	return s.doStat(pid, sc, true)
 }
 
@@ -551,7 +551,7 @@ func (s *Sentry) sysFcntl(sc SyscallArgs) uint64 {
 // Returns the list of files in our virtual filesystem.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysGetdents64(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysGetdents64(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	buf := sc.Args[1]
 	bufSize := sc.Args[2]
@@ -692,7 +692,7 @@ func (s *Sentry) sysMmap(sc SyscallArgs) uint64 {
 //nolint:unused,unparam // educational placeholder — TLS setup lives
 // in the kernel via SYSEMU passthrough, not in a userspace handler.
 // pid is kept in the signature to match the platform's handler shape.
-func (s *Sentry) sysArchPrctl(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysArchPrctl(_, pid int, sc SyscallArgs) uint64 {
 	code := int(sc.Args[0])
 
 	switch code {
@@ -717,7 +717,7 @@ func (s *Sentry) sysArchPrctl(pid int, sc SyscallArgs) uint64 {
 // Get/set resource limits. We return generous defaults.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysPrlimit64(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysPrlimit64(_, pid int, sc SyscallArgs) uint64 {
 	oldLimitPtr := sc.Args[3]
 
 	if oldLimitPtr != 0 {
@@ -737,7 +737,7 @@ func (s *Sentry) sysPrlimit64(pid int, sc SyscallArgs) uint64 {
 // /dev/urandom. We use Go's crypto/rand.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysGetrandom(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysGetrandom(_, pid int, sc SyscallArgs) uint64 {
 	buf := sc.Args[0]
 	bufLen := sc.Args[1]
 
@@ -762,7 +762,7 @@ func (s *Sentry) sysGetrandom(pid int, sc SyscallArgs) uint64 {
 // and dispatch to the same path sysWrite uses.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysWritev(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysWritev(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	iovPtr := sc.Args[1]
 	iovcnt := int(sc.Args[2])
@@ -827,7 +827,7 @@ func (s *Sentry) sysWritev(pid int, sc SyscallArgs) uint64 {
 // returns ENOENT.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysReadlinkat(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysReadlinkat(_, pid int, sc SyscallArgs) uint64 {
 	// readlinkat(dirfd, pathname, buf, bufsiz)
 	pathPtr := sc.Args[1]
 	bufPtr := sc.Args[2]
@@ -836,7 +836,7 @@ func (s *Sentry) sysReadlinkat(pid int, sc SyscallArgs) uint64 {
 	return s.doReadlink(pid, path, bufPtr, bufsiz)
 }
 
-func (s *Sentry) sysReadlink(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysReadlink(_, pid int, sc SyscallArgs) uint64 {
 	pathPtr := sc.Args[0]
 	bufPtr := sc.Args[1]
 	bufsiz := sc.Args[2]
@@ -866,7 +866,7 @@ func (s *Sentry) doReadlink(pid int, path string, bufPtr, bufsiz uint64) uint64 
 // length (including the NUL).
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysGetcwd(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysGetcwd(_, pid int, sc SyscallArgs) uint64 {
 	bufPtr := sc.Args[0]
 	size := sc.Args[1]
 	const cwd = "/\x00"
@@ -884,7 +884,7 @@ func (s *Sentry) sysGetcwd(pid int, sc SyscallArgs) uint64 {
 // the host's. struct utsname is 6 × 65-byte fixed strings (390 bytes).
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysUname(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysUname(_, pid int, sc SyscallArgs) uint64 {
 	bufPtr := sc.Args[0]
 	var buf [6 * 65]byte
 	fields := []string{
@@ -956,7 +956,7 @@ func (s *Sentry) sysDup2(sc SyscallArgs) uint64 {
 // probing for free memory or mount flags.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysSysinfo(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysSysinfo(_, pid int, sc SyscallArgs) uint64 {
 	bufPtr := sc.Args[0]
 	// struct sysinfo { long uptime; ulong loads[3]; ulong totalram;
 	//                  ulong freeram; ulong sharedram; ulong bufferram;
@@ -973,7 +973,7 @@ func (s *Sentry) sysSysinfo(pid int, sc SyscallArgs) uint64 {
 	return 0
 }
 
-func (s *Sentry) sysFstatfs(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysFstatfs(_, pid int, sc SyscallArgs) uint64 {
 	bufPtr := sc.Args[1]
 	// struct statfs on amd64 is 120 bytes. We zero-fill except for a
 	// sane block size and a benign "tmpfs-ish" magic.
@@ -994,7 +994,7 @@ func (s *Sentry) sysFstatfs(pid int, sc SyscallArgs) uint64 {
 // ignore it, so returning 0 (success) is always correct.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysFadvise64(_ int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysFadvise64(_, _ int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	if s.shouldPassthroughFD(fd) {
 		s.requestPassthrough(nil)
@@ -1012,7 +1012,7 @@ func (s *Sentry) sysFadvise64(_ int, sc SyscallArgs) uint64 {
 // so callers use the normal path which we handle fine.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysCopyFileRange(_ int, _ SyscallArgs) uint64 {
+func (s *Sentry) sysCopyFileRange(_, _ int, _ SyscallArgs) uint64 {
 	return errno(syscall.ENOSYS)
 }
 
@@ -1024,7 +1024,7 @@ func (s *Sentry) sysCopyFileRange(_ int, _ SyscallArgs) uint64 {
 // cases and return 0 (success) or EINVAL for unknown options.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysPrctl(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysPrctl(_, pid int, sc SyscallArgs) uint64 {
 	option := int(sc.Args[0])
 
 	switch option {
@@ -1057,7 +1057,7 @@ func (s *Sentry) sysPrctl(pid int, sc SyscallArgs) uint64 {
 // to decide whether to stat() lazily).
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysStatfs(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysStatfs(_, pid int, sc SyscallArgs) uint64 {
 	pathPtr := sc.Args[0]
 	bufPtr := sc.Args[1]
 	path := readStringFromChild(pid, pathPtr, 256)
@@ -1087,7 +1087,7 @@ func (s *Sentry) sysStatfs(pid int, sc SyscallArgs) uint64 {
 // we fabricate a response from the same data doStat uses.
 // ──────────────────────────────────────────────────────────────────────
 
-func (s *Sentry) sysStatx(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysStatx(_, pid int, sc SyscallArgs) uint64 {
 	pathPtr := sc.Args[1]
 	bufPtr := sc.Args[4]
 	flags := sc.Args[2]
@@ -1235,7 +1235,7 @@ func readStringFromChild(pid int, addr uint64, maxLen int) string {
 // arm64 (amd64 has sa_restorer, arm64 doesn't); we look up the offsets
 // from the per-arch kernelSigactionLayout and size from
 // kernelSigactionSize defined in regs_<arch>.go.
-func (s *Sentry) sysRtSigaction(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysRtSigaction(_, pid int, sc SyscallArgs) uint64 {
 	signum := int(sc.Args[0])
 	actPtr := sc.Args[1]
 	oldactPtr := sc.Args[2]
@@ -1298,7 +1298,7 @@ func (s *Sentry) sysRtSigaction(pid int, sc SyscallArgs) uint64 {
 // *old_ss from its copy, which is always in sync with ours because we
 // passthrough every successful write. The mirror exists for
 // deliverOne's SA_ONSTACK branch, not for serving reads.
-func (s *Sentry) sysSigaltstack(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysSigaltstack(_, pid int, sc SyscallArgs) uint64 {
 	ssPtr := sc.Args[0]
 	if ssPtr != 0 {
 		buf := readFromChild(pid, ssPtr, 24)
@@ -1328,7 +1328,7 @@ func (s *Sentry) sysSigaltstack(pid int, sc SyscallArgs) uint64 {
 //                      sigset_t *oldset, size_t sigsetsize);
 //
 // how: SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2.
-func (s *Sentry) sysRtSigprocmask(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysRtSigprocmask(_, pid int, sc SyscallArgs) uint64 {
 	how := int(sc.Args[0])
 	setPtr := sc.Args[1]
 	oldsetPtr := sc.Args[2]
@@ -1372,7 +1372,7 @@ func (s *Sentry) sysRtSigprocmask(pid int, sc SyscallArgs) uint64 {
 // namespace: we call the real kernel kill() with the tracee's actual
 // PID. Other target pids passthrough unmodified (in practice the
 // guest rarely targets anything else because it only sees itself).
-func (s *Sentry) sysKill(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysKill(_, pid int, sc SyscallArgs) uint64 {
 	targetPid := int64(sc.Args[0])
 	signum := int(sc.Args[1])
 	if targetPid == 1 || targetPid == 0 || targetPid == -1 {
@@ -1388,7 +1388,7 @@ func (s *Sentry) sysKill(pid int, sc SyscallArgs) uint64 {
 
 // sysTkill — tkill(tid, sig). The tracee's view of its own TID is 1
 // (see SYS_GETTID), so the same rewrite applies.
-func (s *Sentry) sysTkill(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysTkill(_, pid int, sc SyscallArgs) uint64 {
 	targetTid := int64(sc.Args[0])
 	signum := int(sc.Args[1])
 	if targetTid == 1 {
@@ -1399,7 +1399,7 @@ func (s *Sentry) sysTkill(pid int, sc SyscallArgs) uint64 {
 }
 
 // sysTgkill — tgkill(tgid, tid, sig).
-func (s *Sentry) sysTgkill(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysTgkill(_, pid int, sc SyscallArgs) uint64 {
 	tgid := int64(sc.Args[0])
 	tid := int64(sc.Args[1])
 	signum := int(sc.Args[2])

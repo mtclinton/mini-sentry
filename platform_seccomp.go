@@ -308,7 +308,9 @@ func (p *SeccompPlatform) notifLoop(child, listenerFD int) (int, error) {
 				Number: uint64(uint32(notif.Data.Nr)),
 				Args:   notif.Data.Args,
 			}
-			ret, action := p.sentry.HandleSyscall(int(notif.PID), sc)
+			// Pre-multi-thread: tgid == tid == notif.PID. Commit 2
+			// of ADR 002 splits these when per-thread state lands.
+			ret, action := p.sentry.HandleSyscall(int(notif.PID), int(notif.PID), sc)
 
 			resp := seccompNotifResp{ID: notif.ID}
 			switch action {

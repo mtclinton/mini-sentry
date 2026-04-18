@@ -197,7 +197,7 @@ func FuzzSyscallArgs(f *testing.F) {
 		case unix.SYS_KILL, unix.SYS_TKILL, unix.SYS_TGKILL:
 			return
 		}
-		_, _ = sentry.HandleSyscall(self, sc)
+		_, _ = sentry.HandleSyscall(self, self, sc)
 	})
 }
 

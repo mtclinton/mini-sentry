@@ -71,8 +71,14 @@ const (
 // SyscallHandler implements one syscall. Returns the value the sandboxed
 // process will see as the syscall result (negative = -errno).
 //
+// The (tgid, tid) pair identifies the specific task that issued the
+// syscall. Phase 3c commit 0 (ADR 002 §4.3) grew the signature ahead of
+// multi-thread routing; until commit 3 wires it up, callers pass the
+// same pid for both slots and handler bodies only look at tid (it's
+// what ptrace and process_vm_readv/writev address).
+//
 // Maps to: gVisor's kernel.SyscallFn in pkg/sentry/kernel/syscalls.go
-type SyscallHandler func(s *Sentry, pid int, sc SyscallArgs) uint64
+type SyscallHandler func(s *Sentry, tgid, tid int, sc SyscallArgs) uint64
 
 // SyscallEntry is one row of the syscall dispatch table.
 //
@@ -239,7 +245,7 @@ func (s *Sentry) buildSyscallTable() {
 		s.syscalls[nr] = SyscallEntry{name: name, passthrough: true}
 	}
 	constRet := func(v uint64) SyscallHandler {
-		return func(*Sentry, int, SyscallArgs) uint64 { return v }
+		return func(*Sentry, int, int, SyscallArgs) uint64 { return v }
 	}
 
 	s.syscalls = make(map[uint64]SyscallEntry)
@@ -251,11 +257,11 @@ func (s *Sentry) buildSyscallTable() {
 	emulated(unix.SYS_PWRITE64, "pwrite64", (*Sentry).sysPwrite64)
 	emulated(unix.SYS_WRITEV, "writev", (*Sentry).sysWritev)
 	emulated(unix.SYS_OPENAT, "openat", (*Sentry).sysOpenat)
-	emulated(unix.SYS_CLOSE, "close", func(s *Sentry, _ int, sc SyscallArgs) uint64 { return s.sysClose(sc) })
+	emulated(unix.SYS_CLOSE, "close", func(s *Sentry, _, _ int, sc SyscallArgs) uint64 { return s.sysClose(sc) })
 	emulated(unix.SYS_NEWFSTATAT, "newfstatat", (*Sentry).sysStat)
-	emulated(unix.SYS_LSEEK, "lseek", func(s *Sentry, _ int, sc SyscallArgs) uint64 { return s.sysLseek(sc) })
-	emulated(unix.SYS_IOCTL, "ioctl", func(s *Sentry, _ int, sc SyscallArgs) uint64 { return s.sysIoctl(sc) })
-	emulated(unix.SYS_FCNTL, "fcntl", func(s *Sentry, _ int, sc SyscallArgs) uint64 { return s.sysFcntl(sc) })
+	emulated(unix.SYS_LSEEK, "lseek", func(s *Sentry, _, _ int, sc SyscallArgs) uint64 { return s.sysLseek(sc) })
+	emulated(unix.SYS_IOCTL, "ioctl", func(s *Sentry, _, _ int, sc SyscallArgs) uint64 { return s.sysIoctl(sc) })
+	emulated(unix.SYS_FCNTL, "fcntl", func(s *Sentry, _, _ int, sc SyscallArgs) uint64 { return s.sysFcntl(sc) })
 	emulated(unix.SYS_GETDENTS64, "getdents64", (*Sentry).sysGetdents64)
 	emulated(unix.SYS_FACCESSAT, "faccessat", (*Sentry).sysFaccessat)
 	emulated(unix.SYS_READLINKAT, "readlinkat", (*Sentry).sysReadlinkat)
@@ -268,8 +274,8 @@ func (s *Sentry) buildSyscallTable() {
 	emulated(unix.SYS_STATX, "statx", (*Sentry).sysStatx)
 	emulated(unix.SYS_FADVISE64, "fadvise64", (*Sentry).sysFadvise64)
 	emulated(unix.SYS_COPY_FILE_RANGE, "copy_file_range", (*Sentry).sysCopyFileRange)
-	emulated(unix.SYS_DUP, "dup", func(s *Sentry, _ int, sc SyscallArgs) uint64 { return s.sysDup(sc) })
-	emulated(unix.SYS_DUP3, "dup3", func(s *Sentry, _ int, sc SyscallArgs) uint64 { return s.sysDup2(sc) })
+	emulated(unix.SYS_DUP, "dup", func(s *Sentry, _, _ int, sc SyscallArgs) uint64 { return s.sysDup(sc) })
+	emulated(unix.SYS_DUP3, "dup3", func(s *Sentry, _, _ int, sc SyscallArgs) uint64 { return s.sysDup2(sc) })
 
 	// ── Network (virtual TCP proxy via the Sentry) ──────────────────
 	// socket() allocates a virtual fd; connect() dials the real
@@ -288,7 +294,7 @@ func (s *Sentry) buildSyscallTable() {
 	// set_tid_address stores a pointer for clear_child_tid on exit.
 	// Return the child's TID (we fake it as the PID).
 	emulated(unix.SYS_SET_TID_ADDRESS, "set_tid_address",
-		func(_ *Sentry, pid int, _ SyscallArgs) uint64 { return uint64(pid) })
+		func(_ *Sentry, _, tid int, _ SyscallArgs) uint64 { return uint64(tid) })
 	emulated(unix.SYS_SET_ROBUST_LIST, "set_robust_list", constRet(0))
 	emulated(unix.SYS_RSEQ, "rseq", constRet(0))
 	emulated(unix.SYS_PRLIMIT64, "prlimit64", (*Sentry).sysPrlimit64)
@@ -422,7 +428,11 @@ func (s *Sentry) PostPassthrough(pid int, retval uint64) {
 //
 // The SyscallAction tells the Platform whether to inject the returned value
 // (ActionReturn) or to execute the syscall in the real kernel (ActionPassthrough).
-func (s *Sentry) HandleSyscall(pid int, sc SyscallArgs) (uint64, SyscallAction) {
+//
+// (tgid, tid) identifies the specific task. Pre-multi-thread (Phase 3c
+// commits 0-1) both platforms pass the same pid for both slots; commit
+// 3 splits them when per-thread routing lands.
+func (s *Sentry) HandleSyscall(tgid, tid int, sc SyscallArgs) (uint64, SyscallAction) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -449,7 +459,7 @@ func (s *Sentry) HandleSyscall(pid int, sc SyscallArgs) (uint64, SyscallAction) 
 		return 0, ActionPassthrough
 	}
 
-	ret := entry.handler(s, pid, sc)
+	ret := entry.handler(s, tgid, tid, sc)
 	if s.pendingPassthrough {
 		return 0, ActionPassthrough
 	}

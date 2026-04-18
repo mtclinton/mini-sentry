@@ -36,7 +36,7 @@ import (
 // sysRtSigreturn restores guest state from the rt_sigframe parked on
 // the user stack.  Only registered on amd64 (sentry_amd64.go); other
 // arches keep the passthrough entry from buildSyscallTable.
-func (s *Sentry) sysRtSigreturn(pid int, _ SyscallArgs) uint64 {
+func (s *Sentry) sysRtSigreturn(_, pid int, _ SyscallArgs) uint64 {
 	// Under seccomp there is no ptrace relationship — GETREGS fails
 	// and we can't restore state from userspace.  Fall back to the
 	// pre-3b passthrough.

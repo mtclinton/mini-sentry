@@ -154,7 +154,7 @@ const (
 // sysSocket — socket(domain, type, protocol). We only promise TCP over
 // IPv4/IPv6; everything else gets EAFNOSUPPORT so the guest doesn't
 // silently get a virtual fd it can't use.
-func (s *Sentry) sysSocket(_ int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysSocket(_, _ int, sc SyscallArgs) uint64 {
 	domain := int(sc.Args[0])
 	typ := int(sc.Args[1])
 
@@ -233,7 +233,7 @@ func encodeSockaddr(ip net.IP, port int) []byte {
 // sockaddr, checks the policy, and if allowed dials the real connection
 // itself. The net.Conn is stashed on the OpenFile so subsequent
 // read/write/send/recv can use it without touching the host.
-func (s *Sentry) sysConnect(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysConnect(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	addr := sc.Args[1]
 	addrlen := sc.Args[2]
@@ -290,7 +290,7 @@ func (s *Sentry) sysConnect(pid int, sc SyscallArgs) uint64 {
 // sysSendto — for stream sockets we already have a connected conn, so
 // the addr argument is ignored (this matches Linux kernel behaviour:
 // sendto on a connected TCP socket writes to the peer regardless).
-func (s *Sentry) sysSendto(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysSendto(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	buf := sc.Args[1]
 	count := sc.Args[2]
@@ -327,7 +327,7 @@ func (s *Sentry) sysSendto(pid int, sc SyscallArgs) uint64 {
 // sysRecvfrom — on a connected stream socket this is just a read from
 // the peer. If the guest supplied a non-null addr, we fill it with the
 // peer address so recvfrom-with-addr code paths keep working.
-func (s *Sentry) sysRecvfrom(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysRecvfrom(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	buf := sc.Args[1]
 	count := sc.Args[2]
@@ -389,7 +389,7 @@ func writePeerAddr(pid int, addrPtr, addrLenPtr uint64, ip net.IP, port int) {
 
 // sysGetpeername / sysGetsockname — return the endpoint the real
 // net.Conn is bound to. Not-yet-connected sockets get ENOTCONN.
-func (s *Sentry) sysGetpeername(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysGetpeername(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	f, ok := s.fdTable[fd]
 	if !ok {
@@ -405,7 +405,7 @@ func (s *Sentry) sysGetpeername(pid int, sc SyscallArgs) uint64 {
 	return 0
 }
 
-func (s *Sentry) sysGetsockname(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysGetsockname(_, pid int, sc SyscallArgs) uint64 {
 	fd := int(sc.Args[0])
 	f, ok := s.fdTable[fd]
 	if !ok {
@@ -427,7 +427,7 @@ func (s *Sentry) sysGetsockname(pid int, sc SyscallArgs) uint64 {
 // set on freshly-opened sockets, reject everything else. We're not a
 // real stack, but we shouldn't break programs that blindly call
 // setsockopt(SO_REUSEADDR, 1) before connect().
-func (s *Sentry) sysSetsockopt(_ int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysSetsockopt(_, _ int, sc SyscallArgs) uint64 {
 	level := int(sc.Args[1])
 	optname := int(sc.Args[2])
 	if level == syscall.SOL_SOCKET {
@@ -442,7 +442,7 @@ func (s *Sentry) sysSetsockopt(_ int, sc SyscallArgs) uint64 {
 	return errno(syscall.ENOPROTOOPT)
 }
 
-func (s *Sentry) sysGetsockopt(pid int, sc SyscallArgs) uint64 {
+func (s *Sentry) sysGetsockopt(_, pid int, sc SyscallArgs) uint64 {
 	level := int(sc.Args[1])
 	optname := int(sc.Args[2])
 	optval := sc.Args[3]

@@ -313,7 +313,9 @@ func (p *PtracePlatform) handleSyscallStop(pid int) error {
 	// This is the key abstraction: the Platform doesn't know what the
 	// syscalls mean. It just reads numbers and passes them to the Sentry.
 	// The Sentry is the kernel — it decides what to do.
-	ret, action := p.sentry.HandleSyscall(pid, sc)
+	// Pre-multi-thread: tgid == tid == pid. Commit 2 of ADR 002
+	// splits these when per-thread state lands.
+	ret, action := p.sentry.HandleSyscall(pid, pid, sc)
 
 	if action == ActionPassthrough {
 		// The Sentry wants the real kernel to run this syscall.
