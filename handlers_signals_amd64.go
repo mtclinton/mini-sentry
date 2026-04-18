@@ -66,8 +66,36 @@ func (s *Sentry) sysRtSigreturn(_, pid int, _ SyscallArgs) uint64 {
 	if wantFp := frameBase + uint64(FrameOffFpstate); fpstatePtr != wantFp {
 		sigLogf("fpstate_ptr=0x%x want=0x%x (frame@0x%x)", fpstatePtr, wantFp, frameBase)
 	}
-	pregs := ptraceRegsFromSyscall(&newRegs)
-	if err := unix.PtraceSetRegs(pid, &pregs); err != nil {
+	// Merge restored fields into the live regs we GETREGS'd on entry.
+	// writeMContext only persists GPRs + RIP + RSP + Eflags + kernel
+	// Cs/Ss constants; segment registers and FS_base / GS_base stay
+	// zero in newRegs. PTRACE_SETREGS with CS=0 is rejected by the
+	// kernel as non-canonical (EIO), so we keep Cs/Ss/Fs_base/Gs_base
+	// and the Ds/Es/Fs/Gs selectors from the pre-sigreturn state — the
+	// handler couldn't have changed them anyway (no segment-writing
+	// instructions survive into userspace on x86_64).
+	regs.R15 = newRegs.R15
+	regs.R14 = newRegs.R14
+	regs.R13 = newRegs.R13
+	regs.R12 = newRegs.R12
+	regs.Rbp = newRegs.Rbp
+	regs.Rbx = newRegs.Rbx
+	regs.R11 = newRegs.R11
+	regs.R10 = newRegs.R10
+	regs.R9 = newRegs.R9
+	regs.R8 = newRegs.R8
+	regs.Rax = newRegs.Rax
+	regs.Rcx = newRegs.Rcx
+	regs.Rdx = newRegs.Rdx
+	regs.Rsi = newRegs.Rsi
+	regs.Rdi = newRegs.Rdi
+	regs.Rip = newRegs.Rip
+	regs.Rsp = newRegs.Rsp
+	regs.Eflags = newRegs.Eflags
+	// Orig_rax: the kernel keys syscall-exit bookkeeping off this;
+	// stomping it with the mcontext's zero would confuse ptrace's
+	// next-syscall tracking. Leave it as GETREGS read it.
+	if err := unix.PtraceSetRegs(pid, &regs); err != nil {
 		sigLogf("SETREGS: %v", err)
 		return errno(unix.EFAULT)
 	}
