@@ -18,6 +18,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -95,25 +98,38 @@ func main() {
 	}
 	fmt.Println()
 
-	// Test 7 exercises the Sentry's pending-queue drain via the SIG_IGN
-	// path. Raw-syscall rt_sigaction(SIG_IGN) for SIGUSR1 sidesteps
-	// Go's os/signal (which sets up a multi-thread routing tree the
-	// Sentry's multi-thread delivery can't yet round-trip: ADR 002 §6
-	// commit 4 will introduce a proper multi-threaded handler test).
-	// kill(self, SIGUSR1) hits sysKill → group queue → drain sees
-	// SIG_IGN and drops the entry. kill() returns 0 and execution
-	// continues, proving commit 3's group-routing path lands on an
-	// eligible thread and the drain short-circuits cleanly.
-	fmt.Printf("Test 7 — Signals (SIG_IGN drop via Sentry queue)\n")
-	if err := installSigIgn(syscall.SIGUSR1); err != nil {
-		fmt.Printf("  ERROR: rt_sigaction(SIGUSR1, SIG_IGN): %v\n", err)
+	// Test 7 (ADR 002 §5.1) — real SIGUSR1 handler round-trip. Install a
+	// pure-asm handler via raw rt_sigaction (bypassing os/signal and its
+	// gsignal routing), kill(self, SIGUSR1), observe the handler bump
+	// sigCounter. Proves Phase 3c's per-thread routing lands a
+	// group-directed kill on an eligible thread AND Phase 3b's
+	// BuildRtSigframe + sysRtSigreturn round-trip works end-to-end.
+	//
+	// Scoped to the ptrace platform: under seccomp, sendSelfSignal
+	// falls back to a real host kill because there is no Sentry-side
+	// drain, and the self-kill path returns EINTR on the USER_NOTIF
+	// round-trip the moment the kernel delivers the signal we just
+	// raised. That's a seccomp-platform property, not a Phase 3c bug.
+	fmt.Printf("Test 7 — SIGUSR1 handler round-trip (raw rt_sigaction)\n")
+	if !realSigSupported {
+		fmt.Printf("  skipped: real handler is amd64-only in Phase 3c\n")
+	} else if os.Getenv("MINI_SENTRY_PLATFORM") == "seccomp" {
+		fmt.Printf("  skipped: Sentry-side delivery is ptrace-only in Phase 3c\n")
+	} else if err := installRealSigUsr1(); err != nil {
+		fmt.Printf("  ERROR: rt_sigaction(SIGUSR1): %v\n", err)
 	} else {
-		before := time.Now()
+		before := atomic.LoadInt32(&sigCounter)
+		start := time.Now()
 		if err := syscall.Kill(syscall.Getpid(), syscall.SIGUSR1); err != nil {
 			fmt.Printf("  ERROR: kill(self, SIGUSR1): %v\n", err)
 		} else {
-			fmt.Printf("  kill(self, SIGUSR1) returned cleanly after %v\n",
-				time.Since(before))
+			after := atomic.LoadInt32(&sigCounter)
+			if after != before+1 {
+				fmt.Printf("  MISMATCH: counter %d -> %d, want +1\n", before, after)
+			} else {
+				fmt.Printf("  handler ran (counter %d -> %d) in %v\n",
+					before, after, time.Since(start))
+			}
 		}
 	}
 	fmt.Println()
@@ -141,36 +157,60 @@ func main() {
 	}
 	fmt.Println()
 
+	// Test 9 (ADR 002 §5.4) — multi-thread tkill stress. Spawn 4
+	// goroutines, each locks its own OS thread and tgkills itself with
+	// SIGUSR1. Per-thread routing (§3) must send each signal to the
+	// caller's own queue; TRACECLONE (§2) must have each worker
+	// attached so its syscalls reach the Sentry at all. Assert all 4
+	// handler runs land by checking sigCounter delta. A missed thread
+	// hangs at wg.Wait (the goroutine never resumes from tgkill).
+	fmt.Printf("Test 9 — multi-thread tkill stress (4 goroutines)\n")
+	if !realSigSupported {
+		fmt.Printf("  skipped: real handler is amd64-only in Phase 3c\n")
+	} else if os.Getenv("MINI_SENTRY_PLATFORM") == "seccomp" {
+		fmt.Printf("  skipped: Sentry-side delivery is ptrace-only in Phase 3c\n")
+	} else {
+		const workers = 4
+		before := atomic.LoadInt32(&sigCounter)
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				// Pin this goroutine to a dedicated OS thread so its
+				// tgkill routes via a stable host tid. Without the
+				// lock the runtime might migrate the goroutine between
+				// Ms mid-syscall.
+				runtime.LockOSThread()
+				defer runtime.UnlockOSThread()
+				// tgkill(tgid=1, tid=1, SIGUSR1). Both ids are the
+				// spoofed values the Sentry serves via getpid/gettid;
+				// sysTgkill routes by the calling thread's host tid
+				// (handlers.go:sysTgkill → callerThread(pid)).
+				_, _, e := syscall.RawSyscall(syscall.SYS_TGKILL,
+					1, 1, uintptr(syscall.SIGUSR1))
+				if e != 0 {
+					fmt.Printf("  goroutine %d: tgkill errno=%d\n", n, e)
+				}
+			}(i)
+		}
+		wg.Wait()
+		after := atomic.LoadInt32(&sigCounter)
+		delivered := after - before
+		if delivered != int32(workers) {
+			fmt.Printf("  MISMATCH: delivered=%d, want=%d (counter %d -> %d)\n",
+				delivered, workers, before, after)
+		} else {
+			fmt.Printf("  all %d handlers fired (counter %d -> %d)\n",
+				workers, before, after)
+		}
+	}
+	fmt.Println()
+
 	fmt.Println("╔══════════════════════════════════════════════════╗")
 	fmt.Println("║  All tests complete!                             ║")
 	fmt.Println("║  The host kernel never saw any of our syscalls.  ║")
 	fmt.Println("╚══════════════════════════════════════════════════╝")
-}
-
-// sigactionKernel matches the 8-byte-sigset kernel ABI for
-// rt_sigaction — distinct from glibc's padded struct.
-type sigactionKernel struct {
-	Handler  uintptr
-	Flags    uint64
-	Restorer uintptr
-	Mask     uint64
-}
-
-// installSigIgn raw-issues rt_sigaction to set SIG_IGN for sig,
-// bypassing Go's os/signal. The Sentry mirrors the disposition so the
-// pending-queue drain short-circuits to the SIG_IGN branch.
-func installSigIgn(sig syscall.Signal) error {
-	act := sigactionKernel{Handler: 1} // SIG_IGN
-	_, _, e := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION,
-		uintptr(sig),
-		uintptr(unsafe.Pointer(&act)),
-		0,
-		8, // sigsetsize
-		0, 0)
-	if e != 0 {
-		return e
-	}
-	return nil
 }
 
 // stackT is the kernel-ABI sigaltstack layout: sp(u64), flags(i32) +

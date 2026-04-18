@@ -113,7 +113,11 @@ func main() {
 	spec := NewExecSpecDefaults()
 	spec.Program = opts.program
 	spec.Args = opts.programArgs
-	spec.ExtraEnv = opts.env
+	// Stamp the platform name into the guest env so tests that are
+	// platform-sensitive (see cmd/guest/main.go Tests 7/9, which rely
+	// on Sentry-side frame delivery that only the ptrace platform
+	// provides) can key off it without guessing.
+	spec.ExtraEnv = append([]string{"MINI_SENTRY_PLATFORM=" + opts.platform}, opts.env...)
 	spec.Cwd = opts.cwd
 	spec.UID = opts.uid
 	spec.GID = opts.gid
