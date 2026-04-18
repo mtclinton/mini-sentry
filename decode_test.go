@@ -48,7 +48,7 @@ func TestDecodeRtSigframeRoundTrip(t *testing.T) {
 	wantMask := sigset(0x1234_5678_9abc_def0)
 
 	frame, rsp := BuildRtSigframe(&want, &fpWant, Siginfo{Signo: 10},
-		wantMask, 0xdeadbeef)
+		wantMask, 0xdeadbeef, StackT{}, 0)
 
 	gotRegs, gotFp, gotMask, fpPtr, err := DecodeRtSigframe(frame)
 	if err != nil {

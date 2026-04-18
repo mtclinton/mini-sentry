@@ -194,3 +194,47 @@ func TestSignalStateCounters(t *testing.T) {
 		t.Fatalf("installed[SIGINT] = %d, want 1", ss.installed[int(unix.SIGINT)])
 	}
 }
+
+// TestAltStackMirror covers Set/Get round-trip and AltStackUsable's
+// sanity gates. deliverOne leans on AltStackUsable to skip SA_ONSTACK
+// delivery when the mirror looks wrong, so each false-return path has
+// to stay explicit.
+func TestAltStackMirror(t *testing.T) {
+	ss := NewSignalState()
+
+	// Zero-value: no altstack installed → unusable.
+	if ss.AltStackUsable() {
+		t.Fatalf("AltStackUsable on fresh SignalState = true, want false")
+	}
+
+	valid := StackT{SS_sp: 0x7fff_0000_0000, SS_size: 8192}
+	prev := ss.SetAltStack(valid)
+	if prev != (StackT{}) {
+		t.Errorf("SetAltStack returned %+v, want zero", prev)
+	}
+	got := ss.GetAltStack()
+	if got != valid {
+		t.Errorf("GetAltStack = %+v, want %+v", got, valid)
+	}
+	if !ss.AltStackUsable() {
+		t.Error("AltStackUsable on valid altstack = false")
+	}
+
+	// Too small → unusable even though sp is set.
+	ss.SetAltStack(StackT{SS_sp: 0x7fff_0000_0000, SS_size: 512})
+	if ss.AltStackUsable() {
+		t.Error("AltStackUsable with SS_size<minSigStkSz = true")
+	}
+
+	// SS_DISABLE → unusable regardless of size.
+	ss.SetAltStack(StackT{SS_sp: 0x7fff_0000_0000, SS_flags: ssDisable, SS_size: 8192})
+	if ss.AltStackUsable() {
+		t.Error("AltStackUsable with ssDisable set = true")
+	}
+
+	// Zero sp → unusable.
+	ss.SetAltStack(StackT{SS_size: 8192})
+	if ss.AltStackUsable() {
+		t.Error("AltStackUsable with SS_sp=0 = true")
+	}
+}

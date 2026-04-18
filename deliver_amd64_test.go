@@ -180,6 +180,57 @@ func TestDeliverResetHand(t *testing.T) {
 	}
 }
 
+// TestChooseFrameTop pins the altstack gating in deliverOne: SA_ONSTACK
+// must be set, the altstack must be enabled and at least MINSIGSTKSZ
+// bytes, and the tracee must not already be running on the altstack
+// (the kernel's on_sig_stack check — re-entering would clobber a
+// running handler). Any failed clause falls back to main-stack
+// delivery, which is encoded as frameTop=0.
+func TestChooseFrameTop(t *testing.T) {
+	validAS := StackT{SS_sp: 0x7fff_0000_0000, SS_size: 8192}
+	cases := []struct {
+		name string
+		act  SigAction
+		as   StackT
+		rsp  uint64
+		want uint64
+	}{
+		{"no SA_ONSTACK flag", SigAction{}, validAS, 0x1000, 0},
+		{"altstack too small", SigAction{flags: saOnStack},
+			StackT{SS_sp: 0x7fff_0000_0000, SS_size: 1024}, 0x1000, 0},
+		{"altstack disabled", SigAction{flags: saOnStack},
+			StackT{SS_sp: 0x7fff_0000_0000, SS_flags: ssDisable, SS_size: 8192},
+			0x1000, 0},
+		{"altstack sp zero", SigAction{flags: saOnStack},
+			StackT{SS_size: 8192}, 0x1000, 0},
+		{"already on altstack", SigAction{flags: saOnStack}, validAS,
+			0x7fff_0000_0100, 0},
+		{"honored", SigAction{flags: saOnStack}, validAS, 0x1000,
+			0x7fff_0000_0000 + 8192},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := chooseFrameTop(tc.act, tc.as, tc.rsp)
+			if got != tc.want {
+				t.Errorf("chooseFrameTop = 0x%x, want 0x%x", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFlagSummaryOnStack extends TestFlagSummary with the SA_ONSTACK
+// addition landed in commit 1 of Phase 3c.
+func TestFlagSummaryOnStack(t *testing.T) {
+	if got := flagSummary(saOnStack); got != " +ONSTACK" {
+		t.Errorf("flagSummary(ONSTACK) = %q, want %q", got, " +ONSTACK")
+	}
+	all := uint64(saNoDefer | saResetHand | saRestart | saOnStack)
+	want := " +NODEFER +RESETHAND +RESTART +ONSTACK"
+	if got := flagSummary(all); got != want {
+		t.Errorf("flagSummary(all) = %q, want %q", got, want)
+	}
+}
+
 // TestDeliverResetHandNotSet confirms the inverse: without SA_RESETHAND
 // the disposition persists across deliveries.
 func TestDeliverResetHandNotSet(t *testing.T) {

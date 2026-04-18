@@ -340,7 +340,11 @@ func (s *Sentry) buildSyscallTable() {
 	// decodes the rt_sigframe and restores the user register file.
 	// arm64 keeps the passthrough until its own decoder lands.
 	passthrough(unix.SYS_RT_SIGRETURN, "rt_sigreturn")
-	passthrough(unix.SYS_SIGALTSTACK, "sigaltstack")
+	// sigaltstack mirrors onto s.signals.altStack so deliverOne can
+	// honor SA_ONSTACK (Phase 3c). Still passthrough-after-mirror
+	// because the kernel also needs to know for synchronous-signal
+	// delivery paths we haven't virtualized.
+	emulated(unix.SYS_SIGALTSTACK, "sigaltstack", (*Sentry).sysSigaltstack)
 	passthrough(unix.SYS_FUTEX, "futex")
 	passthrough(unix.SYS_SCHED_YIELD, "sched_yield")
 	passthrough(unix.SYS_SCHED_GETAFFINITY, "sched_getaffinity")

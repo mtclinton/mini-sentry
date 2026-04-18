@@ -114,7 +114,30 @@ const (
 	saNoDefer   = 0x40000000 // SA_NODEFER: don't auto-add signo to mask
 	saResetHand = 0x80000000 // SA_RESETHAND: flip to SIG_DFL after deliver
 	saRestart   = 0x10000000 // SA_RESTART: restart interrupted syscall
+	saOnStack   = 0x08000000 // SA_ONSTACK: run handler on alternate stack
 )
+
+// ss_flags bits + lower bound for a plausible altstack size. MINSIGSTKSZ
+// is 2048 on amd64 per <asm-generic/signal.h>; newer CPUs with larger
+// XSAVE push this up (glibc started computing it dynamically), but the
+// floor protects us from a guest that points sigaltstack at a 128-byte
+// buffer.
+const (
+	ssOnStack   = 1
+	ssDisable   = 2
+	minSigStkSz = 2048
+)
+
+// StackT mirrors the Linux stack_t ABI (same layout on amd64 and
+// arm64): sp (u64), flags (i32) + 4 bytes pad, size (u64) — 24 bytes
+// total. Lives in signals.go so cross-arch code can reference it; the
+// frame builder's amd64 uc.stack write pokes the same wire layout.
+type StackT struct {
+	SS_sp    uint64
+	SS_flags int32
+	_        int32
+	SS_size  uint64
+}
 
 // sigactionLayout captures the per-architecture offsets within a
 // serialized kernel_sigaction struct. amd64 includes sa_restorer;
@@ -151,6 +174,13 @@ type SignalState struct {
 	// currently masked. Unblockable signals (SIGKILL/SIGSTOP) bypass
 	// the mask check in DequeueUnblocked.
 	pending []pendingSignal
+
+	// altStack is the guest-installed alternate signal stack. Mirrored
+	// on sigaltstack(2) writes; read by deliverOne to decide whether an
+	// SA_ONSTACK handler's frame is anchored on the altstack instead of
+	// the main stack. Zero-value means "no altstack installed" (the
+	// guest hasn't called sigaltstack yet).
+	altStack StackT
 
 	// counters for observability.
 	delivered map[int]int // signum → times actually forwarded to guest
@@ -220,6 +250,41 @@ func (ss *SignalState) GetMask() sigset {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	return ss.mask
+}
+
+// SetAltStack records a new alternate signal stack and returns the
+// previous one. Called from sysSigaltstack under the Sentry's own
+// serialization; we keep the lock here so platform-loop readers
+// (deliverOne) see a consistent snapshot without touching s.mu.
+func (ss *SignalState) SetAltStack(as StackT) StackT {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	old := ss.altStack
+	ss.altStack = as
+	return old
+}
+
+// GetAltStack returns the mirrored altstack. Safe for concurrent reads.
+func (ss *SignalState) GetAltStack() StackT {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.altStack
+}
+
+// AltStackUsable reports whether the mirrored altstack is installed,
+// enabled, and big enough to park an rt_sigframe on. deliverOne uses
+// this to gate SA_ONSTACK frame placement; an unusable altstack falls
+// back to main-stack delivery (matching the kernel's behavior for a
+// guest that set SA_ONSTACK without a valid sigaltstack).
+func (ss *SignalState) AltStackUsable() bool {
+	as := ss.GetAltStack()
+	if as.SS_flags&ssDisable != 0 {
+		return false
+	}
+	if as.SS_sp == 0 || as.SS_size < minSigStkSz {
+		return false
+	}
+	return true
 }
 
 // IsBlocked reports whether signum is currently blocked by the mask.

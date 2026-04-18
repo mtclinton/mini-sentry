@@ -1286,6 +1286,41 @@ func (s *Sentry) sysRtSigaction(pid int, sc SyscallArgs) uint64 {
 	return 0
 }
 
+// sysSigaltstack — mirror the guest's alternate signal stack onto
+// SignalState, then passthrough so the kernel's copy also sees it
+// (synchronous signals like SIGSEGV still go through the kernel's
+// delivery path and SA_ONSTACK there depends on the kernel knowing
+// about the altstack).
+//
+//   int sigaltstack(const stack_t *ss, stack_t *old_ss);
+//
+// Queries (ss==NULL) are a plain passthrough — the kernel writes
+// *old_ss from its copy, which is always in sync with ours because we
+// passthrough every successful write. The mirror exists for
+// deliverOne's SA_ONSTACK branch, not for serving reads.
+func (s *Sentry) sysSigaltstack(pid int, sc SyscallArgs) uint64 {
+	ssPtr := sc.Args[0]
+	if ssPtr != 0 {
+		buf := readFromChild(pid, ssPtr, 24)
+		if len(buf) >= 24 {
+			var as StackT
+			as.SS_sp = binary.LittleEndian.Uint64(buf[0:8])
+			as.SS_flags = int32(binary.LittleEndian.Uint32(buf[8:12]))
+			as.SS_size = binary.LittleEndian.Uint64(buf[16:24])
+			s.signals.SetAltStack(as)
+			_, _ = fmt.Fprintf(logWriter(),
+				"  [sentry] sigaltstack: sp=0x%x size=%d flags=0x%x\n",
+				as.SS_sp, as.SS_size, as.SS_flags)
+		}
+	}
+	// Let the kernel validate and write *old_ss. If validation fails,
+	// the guest sees the real errno; our mirror is speculative but
+	// deliverOne's AltStackUsable gate catches obviously-bad values
+	// before we try to forge a frame on them.
+	s.requestPassthrough(nil)
+	return 0
+}
+
 // sysRtSigprocmask — update the Sentry-side mask mirror, then
 // passthrough.
 //

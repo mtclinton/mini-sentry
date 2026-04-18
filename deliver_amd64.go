@@ -97,7 +97,9 @@ func (p *PtracePlatform) deliverOne(pid int, sig pendingSignal, act SigAction) e
 	info := siginfoFromBytes(sig.info)
 	preMask := p.sentry.signals.GetMask()
 	frameRegs := syscallRegsFromUnix(&regs)
-	frame, newRsp := BuildRtSigframe(&frameRegs, &fpregs, info, preMask, act.restorer)
+	altstack := p.sentry.signals.GetAltStack()
+	frameTop := chooseFrameTop(act, altstack, regs.Rsp)
+	frame, newRsp := BuildRtSigframe(&frameRegs, &fpregs, info, preMask, act.restorer, altstack, frameTop)
 	writeToChild(pid, newRsp, frame)
 
 	regs.Rsp = newRsp
@@ -123,6 +125,35 @@ func (p *PtracePlatform) deliverOne(pid int, sig pendingSignal, act SigAction) e
 	return nil
 }
 
+// chooseFrameTop decides where on the tracee's address space the
+// rt_sigframe anchors. The rules match the kernel:
+//
+//  1. SA_ONSTACK must be set on the disposition.
+//  2. The altstack must be installed, enabled, and at least
+//     MINSIGSTKSZ bytes.
+//  3. The tracee's current rsp must NOT already point inside the
+//     altstack — re-entering the altstack would clobber a running
+//     handler's frame (same as the kernel's `on_sig_stack` check).
+//
+// When any clause fails we return 0 so BuildRtSigframe falls back to
+// anchoring on regs.Rsp (main stack). This matches the kernel giving
+// up on SA_ONSTACK silently — no error reaches the guest.
+func chooseFrameTop(act SigAction, as StackT, rsp uint64) uint64 {
+	if act.flags&saOnStack == 0 {
+		return 0
+	}
+	if as.SS_flags&ssDisable != 0 {
+		return 0
+	}
+	if as.SS_sp == 0 || as.SS_size < minSigStkSz {
+		return 0
+	}
+	if rsp >= as.SS_sp && rsp < as.SS_sp+as.SS_size {
+		return 0
+	}
+	return as.SS_sp + as.SS_size
+}
+
 // flagSummary renders the sa_flags bits the Sentry mirrors into a human-
 // readable tail for the deliver log. SA_RESTART is acknowledged but not
 // acted on — we have no blocking syscall that observes it yet.
@@ -136,6 +167,9 @@ func flagSummary(flags uint64) string {
 	}
 	if flags&saRestart != 0 {
 		tail += " +RESTART"
+	}
+	if flags&saOnStack != 0 {
+		tail += " +ONSTACK"
 	}
 	return tail
 }

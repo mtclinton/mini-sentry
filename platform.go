@@ -37,6 +37,7 @@ import (
 	"os/exec"
 	"runtime"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -207,6 +208,13 @@ func (p *PtracePlatform) interceptLoop(pid int) (int, error) {
 		// The kernel skips the syscall entirely — we are the kernel now.
 		err := ptraceSysemu(pid, 0)
 		if err != nil {
+			if err == syscall.ESRCH {
+				// Tracee died between iterations (multi-threaded
+				// exit_group race). We couldn't recover an exit code
+				// from wait because the tracee is already reaped in
+				// the passthrough path; return cleanly with code 0.
+				return 0, nil
+			}
 			return -1, fmt.Errorf("PTRACE_SYSEMU failed: %w", err)
 		}
 
@@ -382,6 +390,9 @@ func (p *PtracePlatform) passthroughSyscall(pid int, regs *unix.PtraceRegs) erro
 	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
 		return fmt.Errorf("passthrough wait (entry) failed: %w", err)
 	}
+	if exited, ok := drainExitIfTerminating(pid, ws); ok {
+		return exited
+	}
 	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP|0x80 {
 		return fmt.Errorf("passthrough: expected syscall-entry stop, got %v", ws)
 	}
@@ -389,15 +400,22 @@ func (p *PtracePlatform) passthroughSyscall(pid int, regs *unix.PtraceRegs) erro
 	// Resume again. The kernel actually executes the syscall this time
 	// and stops at syscall-exit.
 	if err := syscall.PtraceSyscall(pid, 0); err != nil {
+		if err == syscall.ESRCH {
+			// Tracee died between waits — typically exit_group in a
+			// multi-threaded tracee where another thread's exit has
+			// already torn the group down. Treat as clean exit.
+			return errExitedDuringPassthrough{code: 0}
+		}
 		return fmt.Errorf("passthrough PTRACE_SYSCALL (to exit) failed: %w", err)
 	}
 	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
+		if err == syscall.ECHILD {
+			return errExitedDuringPassthrough{code: 0}
+		}
 		return fmt.Errorf("passthrough wait (exit) failed: %w", err)
 	}
-	if ws.Exited() {
-		// Some syscalls (exit_group) terminate the tracee inside the
-		// kernel call — there's no exit-stop. Propagate.
-		return errExitedDuringPassthrough{code: ws.ExitStatus()}
+	if exited, ok := drainExitIfTerminating(pid, ws); ok {
+		return exited
 	}
 	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP|0x80 {
 		return fmt.Errorf("passthrough: expected syscall-exit stop, got %v", ws)
@@ -411,4 +429,43 @@ type errExitedDuringPassthrough struct{ code int }
 
 func (e errExitedDuringPassthrough) Error() string {
 	return fmt.Sprintf("tracee exited during passthrough: code=%d", e.code)
+}
+
+// drainExitIfTerminating converts a tracee-terminating wait status into
+// errExitedDuringPassthrough so the main loop can surface the exit code.
+// Handles both direct WIFEXITED (exit_group terminated before any ptrace
+// stop) and PTRACE_EVENT_EXIT (TRACEEXIT option fires before the tracee
+// actually dies; we pump one PTRACE_CONT to drain to WIFEXITED). Either
+// wait slot in passthroughSyscall can land here depending on timing —
+// exit_group's entry-resume can go straight to EVENT_EXIT before a
+// syscall-entry stop is reported on some kernels.
+func drainExitIfTerminating(pid int, ws syscall.WaitStatus) (errExitedDuringPassthrough, bool) {
+	if ws.Exited() {
+		return errExitedDuringPassthrough{code: ws.ExitStatus()}, true
+	}
+	if ws.Signaled() {
+		return errExitedDuringPassthrough{code: 128 + int(ws.Signal())}, true
+	}
+	if !ws.Stopped() || ws.TrapCause() != syscall.PTRACE_EVENT_EXIT {
+		return errExitedDuringPassthrough{}, false
+	}
+	var status uint64
+	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE,
+		uintptr(0x4201), // PTRACE_GETEVENTMSG
+		uintptr(pid), 0, uintptr(unsafe.Pointer(&status)), 0, 0)
+	if errno != 0 {
+		// Fall back to zero code; the main loop will still observe
+		// the exit via its own wait4 on the next iteration.
+		_ = syscall.PtraceCont(pid, 0)
+		return errExitedDuringPassthrough{code: 0}, true
+	}
+	if err := syscall.PtraceCont(pid, 0); err != nil {
+		return errExitedDuringPassthrough{code: int(status>>8) & 0xff}, true
+	}
+	// One final wait to reap the real WIFEXITED status and keep the
+	// main loop from observing a stale stop. We discard its result
+	// because status already carries the exit code.
+	var final syscall.WaitStatus
+	_, _ = syscall.Wait4(pid, &final, 0, nil)
+	return errExitedDuringPassthrough{code: int(status>>8) & 0xff}, true
 }

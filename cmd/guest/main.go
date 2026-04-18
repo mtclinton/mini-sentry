@@ -96,13 +96,12 @@ func main() {
 	fmt.Println()
 
 	// Test 7: Exercise Sentry-side signal delivery (Phase 3b commit 3)
-	// via the SIG_IGN drop path. Go's runtime installs its own handler
-	// for SIGURG with SA_ONSTACK — which commit 3 can't emulate yet
-	// (ADR 001 punts alt-stack awareness to 3c). So we bypass Go's
-	// os/signal machinery and raw-syscall rt_sigaction(SIG_IGN) for
-	// SIGUSR1, then kill(self, SIGUSR1). The Sentry's pending queue
-	// drain sees the mirrored SIG_IGN disposition and drops the entry
-	// quietly — kill() returns 0 and execution continues.
+	// via the SIG_IGN drop path. We raw-syscall rt_sigaction(SIG_IGN)
+	// for SIGUSR1 to bypass Go's os/signal (which routes delivery
+	// through a non-main gsignal thread we don't trace — multi-thread
+	// routing is a later Phase 3c concern). Then kill(self, SIGUSR1):
+	// the Sentry's pending-queue drain sees SIG_IGN and drops the
+	// entry. kill() returns 0 and execution continues.
 	fmt.Printf("Test 7 — Signals (SIG_IGN drop via Sentry queue)\n")
 	if err := installSigIgn(syscall.SIGUSR1); err != nil {
 		fmt.Printf("  ERROR: rt_sigaction(SIGUSR1, SIG_IGN): %v\n", err)
@@ -113,6 +112,29 @@ func main() {
 		} else {
 			fmt.Printf("  kill(self, SIGUSR1) returned cleanly after %v\n",
 				time.Since(before))
+		}
+	}
+	fmt.Println()
+
+	// Test 8: sigaltstack(2) mirror round-trip (Phase 3c commit 1).
+	// Install an altstack via raw syscall, read it back, compare sp/size.
+	// The Sentry intercepts both the write and (via passthrough) the
+	// read; a mismatch means our mirror diverged from what the kernel
+	// stored.
+	fmt.Printf("Test 8 — sigaltstack mirror round-trip\n")
+	var altBuf [16384]byte
+	want := stackT{sp: uintptr(unsafe.Pointer(&altBuf[0])), size: uint64(len(altBuf))}
+	if err := setAltStack(&want, nil); err != nil {
+		fmt.Printf("  ERROR: sigaltstack install: %v\n", err)
+	} else {
+		var got stackT
+		if err := setAltStack(nil, &got); err != nil {
+			fmt.Printf("  ERROR: sigaltstack query: %v\n", err)
+		} else if got.sp != want.sp || got.size != want.size {
+			fmt.Printf("  MISMATCH: installed sp=0x%x size=%d, readback sp=0x%x size=%d\n",
+				want.sp, want.size, got.sp, got.size)
+		} else {
+			fmt.Printf("  round-trip OK: sp=0x%x size=%d\n", got.sp, got.size)
 		}
 	}
 	fmt.Println()
@@ -133,10 +155,8 @@ type sigactionKernel struct {
 }
 
 // installSigIgn raw-issues rt_sigaction to set SIG_IGN for sig,
-// bypassing Go's os/signal machinery (which would re-register a
-// SA_ONSTACK handler the Sentry can't yet forge onto the alt stack).
-// The Sentry's rt_sigaction handler mirrors the disposition so the
-// pending-queue drain will short-circuit to the SIG_IGN branch.
+// bypassing Go's os/signal. The Sentry mirrors the disposition so the
+// pending-queue drain short-circuits to the SIG_IGN branch.
 func installSigIgn(sig syscall.Signal) error {
 	act := sigactionKernel{Handler: 1} // SIG_IGN
 	_, _, e := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION,
@@ -145,6 +165,31 @@ func installSigIgn(sig syscall.Signal) error {
 		0,
 		8, // sigsetsize
 		0, 0)
+	if e != 0 {
+		return e
+	}
+	return nil
+}
+
+// stackT is the kernel-ABI sigaltstack layout: sp(u64), flags(i32) +
+// 4 bytes pad, size(u64). Matches the StackT the Sentry mirror uses.
+type stackT struct {
+	sp    uintptr
+	flags int32
+	_     int32
+	size  uint64
+}
+
+// setAltStack wraps raw sigaltstack(2). Either arg may be nil.
+func setAltStack(ss, old *stackT) error {
+	var ssp, oldp uintptr
+	if ss != nil {
+		ssp = uintptr(unsafe.Pointer(ss))
+	}
+	if old != nil {
+		oldp = uintptr(unsafe.Pointer(old))
+	}
+	_, _, e := syscall.RawSyscall(syscall.SYS_SIGALTSTACK, ssp, oldp, 0)
 	if e != 0 {
 		return e
 	}

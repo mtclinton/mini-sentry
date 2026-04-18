@@ -85,13 +85,8 @@ const (
 	kernelSs uint16 = 0x2b
 )
 
-// StackT mirrors kernel stack_t (sigaltstack).  8+4+4pad+8 = 24 bytes.
-type StackT struct {
-	SS_sp    uint64
-	SS_flags int32
-	_        int32
-	SS_size  uint64
-}
+// StackT (kernel stack_t, 24 bytes) is defined in signals.go so
+// non-amd64 code can share it; Ucontext embeds it here.
 
 // MContext mirrors struct sigcontext / mcontext_t on amd64.  256 bytes.
 type MContext struct {
@@ -158,10 +153,20 @@ func BuildRtSigframe(
 	info Siginfo,
 	mask sigset,
 	restorer uint64,
+	altstack StackT,
+	frameTop uint64,
 ) ([]byte, uint64) {
-	// Pick rsp below the current top, rounded down to 16 (AMD64 Sys V
-	// alignment).  64-byte alignment for fpstate is commit 3's job.
-	newRsp := (regs.Rsp - uint64(RtSigframeSize)) &^ uint64(15)
+	// frameTop lets the caller override the anchor point — deliverOne
+	// uses this to park the frame on the altstack when SA_ONSTACK is
+	// honored. Pass 0 for the default "grow down from regs.Rsp"
+	// behavior (all test call sites take this branch). Alignment is
+	// AMD64 Sys V 16-byte; 64-byte fpstate alignment is still a
+	// later-commit concern.
+	anchor := regs.Rsp
+	if frameTop != 0 {
+		anchor = frameTop
+	}
+	newRsp := (anchor - uint64(RtSigframeSize)) &^ uint64(15)
 	fpstateAddr := newRsp + uint64(FrameOffFpstate)
 
 	buf := make([]byte, RtSigframeSize)
@@ -170,8 +175,13 @@ func BuildRtSigframe(
 	le.PutUint64(buf[FrameOffPretcode:], restorer)
 	writeMContext(buf[FrameOffUcontext+UcOffMContext:], regs, fpstateAddr)
 	le.PutUint64(buf[FrameOffUcontext+UcOffSigmask:], uint64(mask))
-	// uc.flags=0, uc.link=0, uc.stack all-zero — see comments on
-	// oracleMaskedRanges in frame_test.go for why we diverge.
+	// uc.flags=0, uc.link=0 — see oracleMaskedRanges in frame_test.go.
+	// uc.stack carries the altstack the caller passed in; the oracle
+	// mask still covers this range because the captured run's
+	// altstack bytes reflect glibc startup state, not ours.
+	le.PutUint64(buf[FrameOffUcontext+UcOffStack+0:], altstack.SS_sp)
+	le.PutUint32(buf[FrameOffUcontext+UcOffStack+8:], uint32(altstack.SS_flags))
+	le.PutUint64(buf[FrameOffUcontext+UcOffStack+16:], altstack.SS_size)
 
 	si := FrameOffSiginfo
 	le.PutUint32(buf[si+0:], uint32(info.Signo))

@@ -157,7 +157,7 @@ func TestBuildRtSigframeMatchesKernel(t *testing.T) {
 	mask := sigset(le.Uint64(oracle[FrameOffUcontext+UcOffSigmask:]))
 
 	// Restorer is masked — any value works.  Use 0xdeadbeef for clarity.
-	frame, _ := BuildRtSigframe(regs, &fpregs, info, mask, 0xdeadbeef)
+	frame, _ := BuildRtSigframe(regs, &fpregs, info, mask, 0xdeadbeef, StackT{}, 0)
 
 	diffMasked(t, frame, oracle)
 }
@@ -208,7 +208,7 @@ func TestBuildRtSigframeXmmPreservation(t *testing.T) {
 	copy(fpregs[xmm0Off:], pattern)
 
 	regs := &syscall.PtraceRegs{Rsp: 0x7fff_ff00_0000}
-	frame, rsp := BuildRtSigframe(regs, &fpregs, Siginfo{Signo: 10}, 0, 0)
+	frame, rsp := BuildRtSigframe(regs, &fpregs, Siginfo{Signo: 10}, 0, 0, StackT{}, 0)
 
 	got := frame[FrameOffFpstate+xmm0Off : FrameOffFpstate+xmm0Off+16]
 	if !bytes.Equal(got, pattern) {
